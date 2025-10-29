@@ -1,0 +1,70 @@
+## 依赖项
+
+* Python3.10
+* Mininet Ubuntu 18.04
+* Ryu SDN Framework (`pip install ryu`)
+* PyTorch (`pip install torch torchvision torchaudio`)
+* NetworkX (`pip install networkx`)
+* Requests (`pip install requests`)
+* NumPy (`pip install numpy`)
+* Matplotlib (`pip install matplotlib`)
+* TMgen (`pip install tmgen`)
+* Pandas (`pip install pandas`)
+
+## 设置
+
+1.  **安装依赖:** 根据上述列表安装所有必需的库。确保 Mininet 和 Ryu 已正确安装并可以运行。
+2.  **配置路径:**
+    * 修改 `RL/config.py` 中的 `xml_topology_path` 指向正确的 Mininet 拓扑文件 (`mininet/topologies/topology2.xml`)。
+    * 确保 `RL/config.py` 中的 Ryu 相关配置 (`RYU_API_URL`, `RYU_CONTROLLER_IP`, `RYU_CONTROLLER_PORT`) 与你的 `ryu/hrl_controller_app.py` 设置一致。
+3.  **创建/修改 Ryu 应用:**
+    * **核心步骤:** 你需要基于 `ryu/sfc_controller.py` 或其他示例，创建 `ryu/hrl_controller_app.py`。这个应用必须：
+        * 实现一个 RESTful API 服务器 (使用 `ryu.app.wsgi`) 来处理来自 `RL/env_sfc_mininet.py` 的请求:
+            * `POST /sfc/reset`: 重置控制器状态。
+            * `POST /sfc/deploy`: 接收 VNF 部署请求 (目标节点、VNF 需求)，计算路径 (可能加入预测)，下发流表，计算奖励并返回。
+            * `GET /network_state`: 收集并返回当前网络状态 (链路带宽、延迟、丢包，节点 CPU 等)。
+            * `POST /sfc/validate_actions`: (可选) 验证哪些节点适合部署下一个 VNF。
+            * `POST /sfc/predict_state`: (可选) 预测在某个节点部署 VNF 后的状态。
+        * 集成网络监控逻辑 (可以利用 `network_monitor.py`, `network_delay.py` 的功能)。
+        * 实现 VNF 部署和路径计算逻辑。
+
+## 如何运行
+
+**请在 Ubuntu 环境下执行以下步骤：**
+
+1.  **启动 Ryu 控制器 (在终端 1):**
+    ```bash
+    cd /path/to/project/ryu
+    ryu-manager hrl_controller_app.py
+    # 保持此终端运行
+    ```
+
+2.  **启动 HRL 训练 (在终端 2，需要 sudo):**
+    ```bash
+    cd /path/to/project/RL
+    sudo python train.py --mode train --name HRL_SFC_Experiment --episodes 2000 --goal_horizon 3
+    # train.py 会自动初始化 SFCEnv (env_sfc_mininet.py)，后者会自动启动 Mininet
+    ```
+
+    * `--mode`: 可以是 `train` (训练), `eval` (评估已保存的模型), `test` (特定测试模式)。
+    * `--name`: 实验名称，用于日志和模型保存。
+    * `--episodes`: 训练的总回合数。
+    * `--goal_horizon`: HRL 中高层目标持续的步数。
+    * `--checkpoint`: (用于 eval/test) 指定要加载的模型检查点路径。
+
+3.  **监控训练:**
+    * 观察 `train.py` 的日志输出。
+    * 使用 TensorBoard 查看训练曲线：
+        ```bash
+        tensorboard --logdir=./runs
+        ```
+        然后在浏览器中打开 TensorBoard 提供的地址 (通常是 `http://localhost:6006`)。
+
+## 关键文件说明
+
+* **`RL/rl.py`:** 实现了 `HierarchicalDQNAgent`，包含高层 (`MetaController`) 和低层 (`SubController`) 的网络结构与决策逻辑。
+* **`RL/train.py`:** 包含 `HierarchicalSFCTrainer` 类，负责整个 HRL 训练流程，管理 Agent 与环境的交互。
+* **`RL/env_sfc_mininet.py`:** (需要你创建/修改) 模拟 SFC 部署的环境，负责启动 Mininet，并通过 REST API 与 Ryu 控制器通信。
+* **`ryu/hrl_controller_app.py`:** (需要你创建/修改) 核心的 Ryu SDN 控制器应用，实现网络状态监控、REST API 接口、VNF 部署逻辑、路径计算和流表下发。
+* **`mininet/topologies/topology2.xml`:** 定义了 Mininet 仿真的网络拓扑结构。
+* **`RL/config.py`:** 集中管理项目的所有配置参数。
