@@ -475,48 +475,20 @@ if __name__ == '__main__':
 ## 性能基准
 
 ### 测试环境
-- CPU: Intel i7-9700K
-- GPU: NVIDIA RTX 2080 Ti
-- 内存: 32GB
-- 拓扑: Abilene (12节点)
+- CPU: 9700x
+- GPU: NVIDIA RTX 5070
+- 内存: 48GB
+- 拓扑: 
 
 ### 基准结果
 
 | 方法 | 成功率 | 平均奖励 | 训练时间 |
 |------|--------|---------|---------|
-| Random | 15% | -5.2 | - |
-| Greedy | 45% | 3.8 | - |
-| DQN | 72% | 12.4 | 2.5h |
-| Dueling DQN | 78% | 14.1 | 2.8h |
-| **HRL (ours)** | **85%** | **16.3** | **3.5h** |
-
----
-
-## 引用
-
-如果您使用本代码，请引用：
-
-```bibtex
-@article{sfc_mapping_drl_2025,
-  title={Hierarchical Deep Reinforcement Learning for Service Function Chain Mapping},
-  author={Your Name},
-  journal={arXiv preprint},
-  year={2025}
-}
-```
-
----
-
-## 许可证
-
-MIT License
-
----
-
-## 联系方式
-
-- 问题反馈: [GitHub Issues]
-- 邮箱: your.email@example.com
+| Random | % |   | - |
+| Greedy | % |   | - |
+| DQN | % |  |   |
+| Dueling DQN |  % |  |  h |
+| **HRL (ours)** | ** %** | ** ** | ** h** |
 
 ---
 
