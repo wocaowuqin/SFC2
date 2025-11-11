@@ -49,9 +49,6 @@ class MSFCE_Solver:
     def __init__(self, path_db_file: Path, topology_matrix: np.ndarray,
                  dc_nodes: List[int], capacities: Dict):
         print("初始化 MSFC-CE 专家求解器...")
-        # ----------------------------------------------------
-        # ✅ 建议: 添加文件加载异常处理
-        # ----------------------------------------------------
         try:
             self.path_db = sio.loadmat(path_db_file)['Paths']
         except FileNotFoundError:
@@ -80,9 +77,6 @@ class MSFCE_Solver:
                     link_map[(i + 1, j + 1)] = lid
                     link_map[(j + 1, i + 1)] = lid
                     lid += 1
-        # ----------------------------------------------------
-        # ✅ 修复 #2: (self.link_map -> link_map)
-        # ----------------------------------------------------
         return lid - 1, link_map
 
     def _get_path_from_db(self, src: int, dst: int, k: int):
@@ -96,7 +90,7 @@ class MSFCE_Solver:
                      for i in range(len(nodes) - 1)
                      if (nodes[i], nodes[i + 1]) in self.link_map]
             return nodes, dist, links
-        except Exception:  # 索引 MAT 结构可能失败
+        except Exception:
             return [], 0, []
 
     def _get_kth_path_max_distance(self, src: int, dst: int, kpath: int) -> int:
@@ -255,6 +249,9 @@ class MSFCE_Solver:
             cost = self._calculate_cost(request, state, tree, hvt)
             return eval_score, paths, tree, hvt, True, 0, cost
 
+    # ----------------------------------------------------
+    # ✅ 修复 #1: 替换为您的新 _calculate_cost 方法
+    # ----------------------------------------------------
     def _calculate_cost(self, request: Dict, state: Dict, tree: np.ndarray, hvt: np.ndarray) -> float:
         """计算部署此方案的资源成本 (用于RL奖励)"""
         bw_cost, cpu_cost, mem_cost = 0, 0, 0
@@ -273,11 +270,33 @@ class MSFCE_Solver:
                 except ValueError:
                     pass
 
-        # TODO: 为成本定义一个归一化权重
-        # 这里的 1, 10, 10 是示例权重，需要调整
-        total_cost = (bw_cost * 1) + (cpu_cost * 10) + (mem_cost * 10)
-        # 归一化成本值，以便奖励函数处理
-        return np.clip(total_cost / 1000.0, 0, 10)
+        # ✅ 修复: 定义归一化权重
+        # 权重设计原则:
+        # - 带宽是共享资源，权重较低
+        # - CPU和内存是节点独占资源，权重较高
+        # - 归一化到容量，使不同资源类型可比较
+
+        bw_weight = 1.0 / self.bandwidth_capacity  # 归一化到 [0, 1]
+        cpu_weight = 10.0 / self.cpu_capacity  # CPU更重要
+        mem_weight = 10.0 / self.memory_capacity  # 内存同样重要
+
+        # 计算归一化成本
+        total_cost = (bw_cost * bw_weight) + (cpu_cost * cpu_weight) + (mem_cost * mem_weight)
+
+        # 归一化到 [0, 10] 范围，便于奖励函数处理
+        # 假设最坏情况：使用所有资源
+        max_possible_cost = (
+                self.link_num * self.bandwidth_capacity * bw_weight +
+                self.dc_num * self.cpu_capacity * cpu_weight +
+                self.dc_num * self.memory_capacity * mem_weight
+        )
+
+        # 避免除以零
+        if max_possible_cost == 0:
+            return 0.0
+
+        normalized_cost = (total_cost / max_possible_cost) * 10.0
+        return np.clip(normalized_cost, 0, 10)
 
     def _calc_atnp(self, tree1: Dict, tree1_path: List[int], d_idx: int,
                    state: Dict, nodes_on_tree: Set[int]):
@@ -362,8 +381,6 @@ class MSFCE_Solver:
             return None, []  # 阻塞
 
         # 记录第一个高层和低层决策
-        # 高层目标 = 哪个目的地 (best_d_idx)
-        # 低层动作 = (i_idx=0 (源点), k_idx=best_k_set[best_d_idx])
         high_level_goal = best_d_idx
         low_level_action = (0, best_k_set[best_d_idx])
         cost = best_cost_set[best_d_idx]
@@ -378,6 +395,25 @@ class MSFCE_Solver:
         nodes_on_tree = set(tree_set[best_d_idx]['paths'])
         unadded = set(range(dest_num)) - {best_d_idx}
 
+        # ----------------------------------------------------
+        # ✅ 修复 #4: (方案 2) 模拟状态更新
+        # ----------------------------------------------------
+
+        # 备份原始状态，以便函数退出时恢复
+        # 注意：我们只备份引用类型（数组），值类型（如 link_ref_count）不需要
+        # （但 network_state 并没有包含 link_ref_count... 这是一个潜在问题，
+        # 专家目前没有考虑 ref_count。为保持与您代码一致，我们只备份传入的）
+
+        # 拷贝 network_state 字典中的数组，以进行本地修改
+        local_network_state = {
+            'bw': network_state['bw'].copy(),
+            'cpu': network_state['cpu'].copy(),
+            'mem': network_state['mem'].copy(),
+            'hvt': network_state['hvt'].copy(),
+            'bw_ref_count': network_state['bw_ref_count'].copy(),  # 假设 ref_count 也传入
+            'request': request  # request 是共享的
+        }
+
         while unadded:
             best_eval, best_plan, best_d, best_action, best_cost = -1, None, -1, (0, 0), 0
 
@@ -386,7 +422,7 @@ class MSFCE_Solver:
                 for conn_path in current_tree['paths_map'].values():
                     t, m, action, cost = self._calc_atnp(
                         {'tree': current_tree['tree'].copy(), 'hvt': current_tree['hvt'].copy()},
-                        conn_path, d_idx, network_state, nodes_on_tree
+                        conn_path, d_idx, local_network_state, nodes_on_tree  # ✅ 使用本地状态
                     )
                     if t.get('feasible') and m > best_eval:
                         best_eval, best_plan, best_d = m, t, d_idx
@@ -408,9 +444,20 @@ class MSFCE_Solver:
             nodes_on_tree.update(best_plan['new_path_full'])
             unadded.remove(best_d)
 
-            # TODO: 关键 - 专家决策时"不"更新状态，但在为 HIRL 训练时，
-            # 我们可能需要在这里"模拟"更新 network_state 以获得更真实的轨迹。
-            # 为简单起见，目前假设
-            # network_state 在一个请求中保持不变。
+            # ✅ 修复 #4: 临时在 local_network_state 上应用资源变化
+            for link_idx in np.where(best_plan['tree'] > 0)[0]:
+                if local_network_state['bw_ref_count'][link_idx] == 0:
+                    local_network_state['bw'][link_idx] -= request['bw_origin']
+                local_network_state['bw_ref_count'][link_idx] += 1
+
+            for node, vnf_t in np.argwhere(best_plan['hvt'] > 0):
+                if local_network_state['hvt'][node, vnf_t] == 0:
+                    try:
+                        j = request['vnf'].index(vnf_t + 1)
+                        local_network_state['cpu'][node] -= request['cpu_origin'][j]
+                        local_network_state['mem'][node] -= request['memory_origin'][j]
+                    except ValueError:
+                        pass
+                local_network_state['hvt'][node, vnf_t] += 1
 
         return current_tree, expert_trajectory

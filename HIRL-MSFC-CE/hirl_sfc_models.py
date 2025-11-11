@@ -31,7 +31,7 @@ class MetaControllerNN:
     """
 
     def __init__(self, state_shape, n_goals, lr=0.00025):
-        self.input_shape = state_shape
+        self.state_shape = state_shape
         self.n_goals = n_goals
         self.replay_hist = [None] * 1000  # DAgger 聚合缓冲区
         self.ind = 0
@@ -41,25 +41,30 @@ class MetaControllerNN:
         self.meta_controller = self._build_model()
         self.meta_controller.compile(loss='categorical_crossentropy', optimizer=rmsProp)
 
+    # def _build_model(self):
+    #     """H-DQN 架构: 输入 = (State, Goal), 输出 = Q(State, Goal, Action)"""
+    #     state_input = Input(shape=self.state_shape, name='state_input')
+    #     goal_input = Input(shape=(self.n_goals,), name='goal_input')
+    #
+    #     merged_input = concatenate([state_input, goal_input])
+    #
+    #     x = Dense(256, activation='relu')(merged_input)
+    #     x = Dense(256, activation='relu')(x)
+    #     output = Dense(self.n_actions, activation='linear', name='q_values')(x)
+    #
+    #     model = Model(inputs=[state_input, goal_input], outputs=output)
+    #
+    #     # ✅ 修复：在这里定义 optimizer
+    #     rmsProp = optimizers.RMSprop(learning_rate=self.lr, rho=0.95, epsilon=1e-08)
+    #
+    #     model.compile(loss='mse', optimizer=rmsProp)
+    #     return model
     def _build_model(self):
-        """H-DQN 架构: 输入 = (State, Goal), 输出 = Q(State, Goal, Action)"""
-        state_input = Input(shape=self.state_shape, name='state_input')
-        goal_input = Input(shape=(self.n_goals,), name='goal_input')
-
-        merged_input = concatenate([state_input, goal_input])
-
-        x = Dense(256, activation='relu')(merged_input)
-        x = Dense(256, activation='relu')(x)
-        output = Dense(self.n_actions, activation='linear', name='q_values')(x)
-
-        model = Model(inputs=[state_input, goal_input], outputs=output)
-
-        # ✅ 修复：在这里定义 optimizer
-        rmsProp = optimizers.RMSprop(learning_rate=self.lr, rho=0.95, epsilon=1e-08)
-
-        model.compile(loss='mse', optimizer=rmsProp)
+        model = Sequential()
+        model.add(Dense(256, activation='relu', input_shape=self.state_shape))
+        model.add(Dense(256, activation='relu'))
+        model.add(Dense(self.n_goals, activation='softmax'))  # ✅ 正确: 输出 n_goals
         return model
-
     def check_training_clock(self):
         return (self.count >= 100)  # 每100次收集就训练一次
 
@@ -123,13 +128,13 @@ class Hdqn_SFC:
         output = Dense(self.n_actions, activation='linear', name='q_values')(x)
 
         model = Model(inputs=[state_input, goal_input], outputs=output)
-        rmsProp = optimizers.RMSprop(lr=self.lr, rho=0.95, epsilon=1e-08, decay=0.0)
+        rmsProp = optimizers.RMSprop(learning_rate=self.lr, rho=0.95, epsilon=1e-08)
         model.compile(loss='mse', optimizer=rmsProp)  # 'mse' 只是占位符，实际 loss 在 Agent 中计算
         return model
 
     def saveWeight(self, file_prefix):
-        self.controllerNet.save_weights(f"{file_prefix}_controller.h5")
+        self.controllerNet.save_weights(f"{file_prefix}_controller.weights.h5")
 
     def loadWeight(self, file_prefix):
-        self.controllerNet.load_weights(f"{file_prefix}_controller.h5")
-        self.targetControllerNet.set_weights(self.controllerNet.get_weights())
+        self.controllerNet.load_weights(f"{file_prefix}_controller.weights.h5")
+        self.controllerNet.reset_states()

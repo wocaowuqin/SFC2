@@ -1,0 +1,154 @@
+好的，这是一个为你项目量身定制的 `README.md` 文件。它详细介绍了你的架构、每个文件的功能（你所说的“各个函数的结构”），以及运行项目所需的依赖包。
+
+-----
+
+# 混合式分层强化学习 VNF 映射项目 (HIRL-SFC)
+
+本项目是一个基于**混合式分层学习 (Hybrid Hierarchical Learning)** 的仿真框架，用于解决**多播 VNF 服务链 (Multicast VNF SFC)** 的动态映射问题。
+
+核心架构结合了**模仿学习 (IL)** 和**强化学习 (RL)**：
+
+1.  **高层 (Meta-Controller)**: 使用**模仿学习 (DAgger)** 来学习“专家”的**战略决策**（即“下一步应该连接哪个目的节点”）。
+2.  **低层 (Low-Level Controller)**: 使用**分层强化学习 (H-DQN)** 来学习如何以**最低的资源成本**（内部奖励）执行高层给出的战略目标。
+
+-----
+
+## 🚀 如何运行
+
+1.  **配置路径**:
+
+      * 打开 `hyperparameters.py` 文件。
+      * 修改 `INPUT_DIR` 指向你的 `.mat` 数据文件 (如 `sorted_requests.mat` 等) 所在的目录。
+      * 修改 `OUTPUT_DIR` 指向你希望保存模型和图表的目录。
+
+2.  **安装依赖包**:
+
+      * 本项目依赖以下 Python 包。
+
+    <!-- end list -->
+
+    ```bash
+    pip install numpy tensorflow gym scipy matplotlib pandas
+    ```
+
+3.  **运行训练**:
+
+    ```bash
+    python train_hirl_sfc.py
+    ```
+
+4.  **查看结果**:
+
+      * 训练过程中的所有指标将保存在 `OUTPUT_DIR/training_metrics.csv`。
+      * 分析图表（奖励、接受率、资源消耗）将保存在 `OUTPUT_DIR` 目录下的 `.png` 文件中。
+
+-----
+
+## 📁 项目文件结构与功能详解
+
+```
+.
+├── (你的数据目录)/mat/
+│   ├── sorted_requests.mat     # 排序后的请求数据
+│   ├── event_list.mat        # 仿真事件列表 (到达/离开)
+│   └── US_Backbone_path.mat    # 预计算的 K-最短路径
+│
+├── (你的输出目录)/out_hirl/
+│   ├── sfc_hirl_model_final.weights.h5  # 训练好的低层模型权重
+│   ├── training_metrics.csv             # 训练指标 (用于绘图)
+│   ├── reward_trend.png                 # 奖励趋势图
+│   ├── acceptance_rate.png              # 接受率图
+│   └── resource_utilization.png         # 资源消耗图
+│
+├── train_hirl_sfc.py         # 1. 训练主循环 (入口)
+├── hirl_sfc_env.py           # 2. 自定义 Gym 环境
+├── expert_msfce.py           # 3. 专家求解器 (启发式算法)
+├── hirl_sfc_agent.py         # 4. 低层 RL 代理 (Agent)
+├── hirl_sfc_models.py        # 5. 高层和低层的神经网络模型
+├── hirl_utils.py             # 6. 辅助工具 (PER, 线性退火)
+└── hyperparameters.py      # 7. 超参数和配置
+```
+
+-----
+
+### 核心模块详解
+
+#### 1\. `train_hirl_sfc.py` (训练主入口)
+
+这是你运行的**主文件**。它负责协调整个训练流程。
+
+  * **`main()`**: 核心训练循环。
+  * **职责**:
+      * 初始化环境 (`SFC_HIRL_Env`)、高层代理 (`MetaControllerNN`) 和低层代理 (`Agent_SFC`)。
+      * **阶段 1 (预训练)**: 完全使用 `expert` 轨迹来预热高层 (IL) 和低层 (RL) 的缓冲区。
+      * **阶段 2 (混合训练)**:
+        1.  高层 `metacontroller` 预测一个**目标 (goal)**。
+        2.  使用 DAgger 检查 `goal` 是否与 `env.get_expert_high_level_goal()` (专家答案) 一致。
+        3.  如果一致，则低层 `low_level_agent` **自主探索**一个**动作 (action)**。
+        4.  执行动作，存储经验，并训练两个网络。
+      * **监控**: 训练结束后，调用 `matplotlib` 和 `pandas` 收集指标、保存 `training_metrics.csv` 并绘制 `.png` 图表。(注意: 脚本已配置 `matplotlib.use('Agg')` 以确保在非交互式环境中正确保存图表。)
+  * **`visualize_state()`, `validate_action_space()`**: 调试工具。
+
+#### 2\. `hirl_sfc_env.py` (SFC 仿真环境)
+
+这是你自定义的**仿真世界**，它继承自 `gym.Env`。
+
+  * **`SFC_HIRL_Env` (class)**:
+  * **职责**:
+      * 加载 `.mat` 数据 (请求、事件、路径)。
+      * 维护全局网络状态（`self.B`, `self.C`, `self.M` - 带宽, CPU, 内存）。
+      * **`reset_request()`**: 推进仿真时间 (`self.t`)，处理离开事件，并准备下一个到达的请求。
+      * **`step_low_level()`**: **核心函数**。根据低层 `action`，调用 `expert` 的计算函数 (如 `_calc_eval`) 来**执行**部署，并返回 `(next_state, cost, sub_task_done, request_done)`。
+      * **`_get_flat_state()`**: 将复杂的网络状态和请求信息**扁平化**为神经网络的输入向量。
+      * **`get_expert_high_level_goal()`**: **(模仿学习标签)** 查询专家在当前状态下“应该”选择哪个目的地。
+      * `get_valid_low_level_actions()`: 动作掩码，返回当前合法的低层动作。
+
+#### 3\. `expert_msfce.py` (专家预言机)
+
+这是你封装的**启发式算法 (MSFC-CE)**。它被环境 (`env`) 用来计算部署和提供“正确答案”。
+
+  * **`MSFCE_Solver` (class)**:
+  * **职责**:
+      * **`solve_request_for_expert()`**: **(预训练用)** 接收一个请求和网络状态，返回完整的**最优解轨迹** `(goal, action, cost)`。
+      * **`_calc_eval()`**, **`_calc_eval1()`**, **`_calc_atnp()`**: 核心启发式计算函数，被 `env.step_low_level` 和 `env.get_expert_high_level_goal` 调用。
+      * **`_calculate_cost()`**: 计算一个部署方案的**归一化资源成本**，这个成本会作为**负奖励**反馈给低层 RL 代理。
+
+#### 4\. `hirl_sfc_agent.py` (低层 RL 代理)
+
+这是**低层代理**的大脑，负责管理 RL 训练的细节。
+
+  * **`Agent_SFC` (class)**:
+  * **职责**:
+      * 管理**优先经验回放 (PER)** 缓冲区 (`self.memory`)。
+      * **`selectMove()`**: **(决策)** 使用 Epsilon-Greedy 策略，根据 `(state, goal_one_hot)` 和 `valid_actions` (动作掩码) 选择一个低层动作。
+      * **`criticize()`**: **(奖励函数)** 定义低层代理的**内部奖励 (Intrinsic Reward)**。`sub_task_completed = +1.0`，`request_failed = -5.0`，并减去 `cost`。
+      * **`store()`**: 存储经验到 PER。
+      * **`_update()`**: **(训练)** 从 PER 采样，执行 Double DQN + PER 更新步骤，并更新目标网络。
+
+#### 5\. `hirl_sfc_models.py` (神经网络模型)
+
+这里定义了高层和低层代理的**神经网络架构** (使用 Keras)。
+
+  * **`MetaControllerNN` (class)**: **高层**模型 (模仿学习)。
+      * **`_build_model()`**: 一个简单的 MLP，`input: state` -\> `output: softmax(n_goals)`。
+      * **`collect()`**, **`train()`**: DAgger 模仿学习的实现。
+  * **`Hdqn_SFC` (class)**: **低层**模型 (RL)。
+      * **`_build_model()`**: H-DQN 架构，`input: (state, goal)` -\> `output: q_values(n_actions)`。
+      * 包含 `controllerNet` (在线网络) 和 `targetControllerNet` (目标网络)。
+
+#### 6\. `hirl_utils.py` (辅助工具)
+
+提供了 RL 训练所需的常用工具。
+
+  * **`PrioritizedReplayBuffer` (class)**: 优先经验回放的实现。
+  * **`SegmentTree` (class)**: PER 底层使用的数据结构。
+  * **`LinearSchedule` (class)**: Epsilon 和 PER Beta 的线性退火。
+
+#### 7\. `hyperparameters.py` (配置文件)
+
+存储所有全局配置和超参数，方便统一修改。
+
+  * **路径**: `INPUT_DIR`, `OUTPUT_DIR`
+  * **拓扑**: `CAPACITIES`, `DC_NODES`, `TOPOLOGY_MATRIX`
+  * **训练**: `PRE_TRAIN_STEPS`, `EPISODE_LIMIT`
+  * **RL 参数**: `GAMMA`, `LR`, `EXP_MEMORY`

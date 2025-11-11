@@ -41,9 +41,6 @@ class SFC_HIRL_Env(gym.Env):
         self.link_ref_count = np.zeros(self.L, dtype=int)
 
         # 加载数据 (来自 DynamicSimulator)
-        # ----------------------------------------------------
-        # ✅ 建议: 添加文件加载异常处理
-        # ----------------------------------------------------
         try:
             reqs = sio.loadmat(input_dir / "sorted_requests.mat")['sorted_requests']
             self.requests = [parse_mat_request(r) for r in reqs]
@@ -70,8 +67,13 @@ class SFC_HIRL_Env(gym.Env):
         self.nodes_on_tree: Set[int] = set()
         self.served_requests = []  # (req, plan)
 
+        # ----------------------------------------------------
+        # ✅ 修复 #3: 新增: 稳定的路径索引管理
+        # ----------------------------------------------------
+        self.tree_path_list: List[List[int]] = []  # 有序路径列表
+        self.tree_path_to_idx: Dict[tuple, int] = {}  # 路径 -> 索引映射
+
         # 定义状态和动作空间
-        # TODO: 这是一个关键且困难的定义。这里使用一个简化的占位符。
         # 状态 = (CPU 负载, Mem 负载, BW 负载, HVT 状态) + (请求信息)
         state_size = self.n + self.n + self.L + (self.n * self.K_vnf)
         req_size = 10  # 简化的请求特征向量
@@ -80,8 +82,7 @@ class SFC_HIRL_Env(gym.Env):
         # 高层动作 = 选择哪个目的地 (假设最多10个目的地)
         self.NB_HIGH_LEVEL_GOALS = 10
 
-        # 低层动作 = (连接到哪个节点 i, 使用哪条路径 k)
-        # 修复建议：i_idx 应该是树上路径的索引，而不是节点索引
+        # 低层动作 = (连接到哪条路径 i, 使用哪条路径 k)
         self.MAX_PATHS_IN_TREE = 10  # 假设一棵树最多有10条路径
         self.NB_LOW_LEVEL_ACTIONS = self.MAX_PATHS_IN_TREE * self.K_path
 
@@ -95,36 +96,89 @@ class SFC_HIRL_Env(gym.Env):
             'hvt': self.hvt_all, 'bw_ref_count': self.link_ref_count
         }
 
+    # ----------------------------------------------------
+    # ✅ 修复 #2: 替换为您的新 _get_flat_state 方法
+    # ----------------------------------------------------
     def _get_flat_state(self) -> np.ndarray:
-        """(TODO) 将当前网络状态和请求扁平化为单个向量"""
-        # 这是一个占位符。你需要一个复杂的函数来正确编码状态。
-        net_state_dict = self._get_network_state_dict()
-        cpu_norm = net_state_dict['cpu'] / self.C_cap
-        mem_norm = net_state_dict['mem'] / self.M_cap
-        bw_norm = net_state_dict['bw'] / self.B_cap
-        hvt_norm = net_state_dict['hvt'].flatten() / 5.0  # 假设最大引用计数为5
+        """
+        将当前网络状态和请求扁平化为单个向量
 
-        # 编码请求 (占位符)
+        状态向量结构:
+        [CPU负载(n维) | 内存负载(n维) | 带宽负载(L维) | HVT状态(n*K维) | 请求特征(固定维)]
+        """
+        net_state_dict = self._get_network_state_dict()
+
+        # 1. 归一化网络资源状态 (当前剩余/总容量)
+        cpu_norm = net_state_dict['cpu'] / self.C_cap  # (n,)
+        mem_norm = net_state_dict['mem'] / self.M_cap  # (n,)
+        bw_norm = net_state_dict['bw'] / self.B_cap  # (L,)
+
+        # 2. HVT状态归一化 (假设最大引用计数为10)
+        hvt_norm = np.clip(net_state_dict['hvt'].flatten() / 10.0, 0, 1)  # (n*K,)
+
+        # 3. 编码当前请求
         req_vec = np.zeros(10)
         if self.current_request:
+            # 特征 0: 带宽需求 (归一化)
             req_vec[0] = self.current_request['bw_origin'] / self.B_cap
-            # ... 更多请求特征
 
+            # 特征 1-2: CPU和内存需求的平均值 (归一化)
+            if self.current_request['cpu_origin']:
+                req_vec[1] = np.mean(self.current_request['cpu_origin']) / self.C_cap
+            if self.current_request['memory_origin']:
+                req_vec[2] = np.mean(self.current_request['memory_origin']) / self.M_cap
+
+            # 特征 3: VNF链长度 (归一化到最大值8)
+            req_vec[3] = len(self.current_request['vnf']) / 8.0
+
+            # 特征 4: 目的节点数量 (归一化到最大值10)
+            req_vec[4] = len(self.current_request['dest']) / 10.0
+
+            # 特征 5: 已完成的目的节点比例
+            if len(self.current_request['dest']) > 0:
+                completed = len(self.current_request['dest']) - len(self.unadded_dest_indices)
+                req_vec[5] = completed / len(self.current_request['dest'])
+
+            # 特征 6: 源节点是否为DC (0或1)
+            req_vec[6] = 1.0 if self.current_request['source'] in self.expert.DC else 0.0
+
+            # 特征 7: 当前树的规模 (节点数 / 总节点数)
+            if self.nodes_on_tree:
+                req_vec[7] = len(self.nodes_on_tree) / self.n
+
+            # 特征 8: 当前树使用的链路数 / 总链路数
+            if self.current_tree:
+                req_vec[8] = np.sum(self.current_tree['tree'] > 0) / self.L
+
+            # 特征 9: 剩余未连接目的节点数 / 总目的节点数
+            req_vec[9] = len(self.unadded_dest_indices) / max(1, len(self.current_request['dest']))
+
+        # 4. 拼接所有部分
         flat_state = np.concatenate([
-            cpu_norm, mem_norm, bw_norm, hvt_norm
+            cpu_norm,  # n维
+            mem_norm,  # n维
+            bw_norm,  # L维
+            hvt_norm  # n*K维
         ])
 
-        # 截断或填充到固定大小
+        # 5. 组合为最终状态向量
         final_state = np.zeros(self.STATE_VECTOR_SIZE)
-        len_to_copy = min(len(flat_state), self.STATE_VECTOR_SIZE - 10)
-        final_state[:len_to_copy] = flat_state[:len_to_copy]
+
+        # 网络状态部分
+        net_state_len = len(flat_state)
+        if net_state_len <= self.STATE_VECTOR_SIZE - 10:
+            final_state[:net_state_len] = flat_state
+        else:
+            # 如果超长，截断 (优先保留CPU、Mem、BW，可能截断部分HVT)
+            final_state[:-10] = flat_state[:self.STATE_VECTOR_SIZE - 10]
+
+        # 请求特征部分 (最后10维)
         final_state[-10:] = req_vec
 
         return final_state.astype(np.float32)
 
     def _handle_leave_events(self, t: int):
         """(来自 DynamicSimulator) 处理离开事件"""
-        # ✅ 修复：防止越界
         if t >= len(self.events):
             return
         leave_ids = self.events[t]['leave']
@@ -169,39 +223,39 @@ class SFC_HIRL_Env(gym.Env):
             if self.t > 0:
                 self._handle_leave_events(self.t - 1)
 
-            # ✅ 修复：防止越界
             if self.t >= len(self.events):
                 self.t += 1
                 continue
 
-            # 获取当前时间步的到达
             arrive_ids = self.events[self.t]['arrive']
             self.t += 1
 
             if arrive_ids.size > 0:
-                # TODO: 目前只处理第一个到达的请求
                 req_id = arrive_ids[0]
                 if req_id in self.req_map:
                     self.current_request = self.req_map[req_id]
 
         if self.current_request is None:
-            return None, self._get_flat_state()  # 仿真结束
+            return None, self._get_flat_state()
 
-        # 2. 初始化 HIRL 状态
+            # 2. 初始化 HIRL 状态
         self.unadded_dest_indices = set(range(len(self.current_request['dest'])))
         self.current_tree = {
             'id': self.current_request['id'],
             'tree': np.zeros(self.L),
             'hvt': np.zeros((self.n, self.K_vnf)),
-            'paths_map': {}  # (dest_node -> path_nodes)
+            'paths_map': {}
         }
         self.nodes_on_tree = set([self.current_request['source']])
 
+        # ----------------------------------------------------
+        # ✅ 修复 #3: 重置路径管理
+        # ----------------------------------------------------
+        self.tree_path_list = []
+        self.tree_path_to_idx = {}
+
         return self.current_request, self._get_flat_state()
 
-    # ----------------------------------------------------
-    # ✅ 修复 #3 和 #5: 替换为您的新 get_expert_high_level_goal 方法
-    # ----------------------------------------------------
     def get_expert_high_level_goal(self, state_vec: np.ndarray) -> int:
         """
         (专家预言机) 查询高层专家：下一步应该连接哪个目的地?
@@ -219,7 +273,6 @@ class SFC_HIRL_Env(gym.Env):
             for d_idx in self.unadded_dest_indices:
                 best_eval = -1
                 for k in range(1, self.K_path + 1):
-                    # ✅ [修复 #3] 完整解包
                     eval_val, paths, tree, hvt_new, feasible, dest, cost = \
                         self.expert._calc_eval(self.current_request, d_idx, k, network_state)
                     if feasible and eval_val > best_eval:
@@ -227,10 +280,10 @@ class SFC_HIRL_Env(gym.Env):
                 tree_set.append((d_idx, best_eval))
 
             if not tree_set or max(tree_set, key=lambda item: item[1])[1] <= 0:
-                return list(self.unadded_dest_indices)[0]  # 随机选一个
+                return list(self.unadded_dest_indices)[0]
 
             best_d_idx, _ = max(tree_set, key=lambda item: item[1])
-            return best_d_idx  # ✅ [修复 #5] 返回原始索引
+            return best_d_idx
 
         else:
             # 阶段2: 寻找最佳分支 (Tree->d)
@@ -242,32 +295,70 @@ class SFC_HIRL_Env(gym.Env):
                     )
                     if m > best_eval:
                         best_eval, best_d = m, d_idx
-            # ✅ [修复 #5] 返回原始索引
             return best_d if best_d != -1 else list(self.unadded_dest_indices)[0]
 
     # ----------------------------------------------------
-    # ✅ 修复 #6: 添加动作掩码函数
+    # ✅ 修复 #3: 新增辅助方法
+    # ----------------------------------------------------
+    def _add_path_to_tree(self, path: List[int]):
+        """添加路径到树的管理结构"""
+        path_tuple = tuple(path)
+        if path_tuple not in self.tree_path_to_idx:
+            idx = len(self.tree_path_list)
+            if idx < self.MAX_PATHS_IN_TREE:  # 防止列表超出动作空间
+                self.tree_path_list.append(path)
+                self.tree_path_to_idx[path_tuple] = idx
+                return idx
+        return self.tree_path_to_idx.get(path_tuple, 0)  # 返回现有索引
+
+    # ----------------------------------------------------
+    # ✅ 修复 #3: 替换 _get_path_for_i_idx
+    # ----------------------------------------------------
+    def _get_path_for_i_idx(self, i_idx: int) -> List[int]:
+        """✅ 修复: 根据 i_idx 获取树上的特定连接路径"""
+        if not self.current_tree['paths_map']:
+            # 对于 S->d 阶段, i_idx 总是0，返回源节点
+            return [self.current_request['source']]
+
+        # ✅ 使用稳定的路径列表
+        if not self.tree_path_list:
+            # 如果还没初始化，从 paths_map 构建
+            self.tree_path_list = list(self.current_tree['paths_map'].values())
+            self.tree_path_to_idx = {
+                tuple(path): idx for idx, path in enumerate(self.tree_path_list)
+            }
+
+        # 安全地获取路径
+        if i_idx < len(self.tree_path_list):
+            return self.tree_path_list[i_idx]
+        else:
+            # 如果索引超出范围，返回第一条路径（兜底）
+            return self.tree_path_list[0] if self.tree_path_list else [self.current_request['source']]
+
+    # ----------------------------------------------------
+    # ✅ 修复 #3: 替换 get_valid_low_level_actions
     # ----------------------------------------------------
     def get_valid_low_level_actions(self) -> List[int]:
-        """返回当前状态下有效的低层动作ID列表"""
+        """✅ 修复: 返回当前状态下有效的低层动作ID列表"""
         valid_actions = []
+
         if not self.current_tree['paths_map']:
             # S->d 阶段: 只有 (i=0, k=0-4) 有效
             for k in range(self.K_path):
                 valid_actions.append(0 * self.K_path + k)
         else:
             # Tree->d 阶段: 遍历所有树上的路径
-            # TODO: 修复 #6.c, 这里的 i_idx 映射仍然是暂时的
-            num_paths = len(self.current_tree['paths_map'])
+            num_paths = len(self.tree_path_list) if self.tree_path_list else len(self.current_tree['paths_map'])
+
             for i in range(num_paths):
                 for k in range(self.K_path):
-                    # 确保动作ID不超过最大值
                     action_id = i * self.K_path + k
+                    # 确保动作ID不超过最大值
                     if action_id < self.NB_LOW_LEVEL_ACTIONS:
                         valid_actions.append(action_id)
 
+        # 确保总有至少一个动作可选
         if not valid_actions:
-            # 确保总有至少一个动作可选，防止掩码为空
             return [0]
 
         return valid_actions
@@ -276,23 +367,10 @@ class SFC_HIRL_Env(gym.Env):
         """将扁平化的低层动作ID (0-N) 解码为 (i_idx, k_idx)"""
         k_idx = action % self.K_path
         i_idx = action // self.K_path
-        # ----------------------------------------------------
-        # ⚠️ 修复 #6.c (建议): 这里的映射仍然是不稳定的!
-        # ----------------------------------------------------
-        # 确保 i_idx 在当前树的节点范围内
-        i_idx = i_idx % max(1, len(self.current_tree['paths_map']))
+        # 限制 i_idx 在当前树的路径数内 (或最大动作空间)
+        num_paths = max(1, len(self.tree_path_list))
+        i_idx = i_idx % min(num_paths, self.MAX_PATHS_IN_TREE)
         return i_idx, k_idx
-
-    def _get_path_for_i_idx(self, i_idx: int) -> List[int]:
-        """(TODO) 根据 i_idx 获取树上的特定连接路径"""
-        if not self.current_tree['paths_map']:
-            return [self.current_request['source']]  # 对于 S->d, i_idx 总是0
-
-        # ----------------------------------------------------
-        # ⚠️ 修复 #6.c (建议): 这里的映射仍然是不稳定的!
-        # ----------------------------------------------------
-        path_list = list(self.current_tree['paths_map'].values())
-        return path_list[i_idx % len(path_list)]
 
     def step_low_level(self, goal_dest_idx: int, low_level_action: int) -> \
             Tuple[np.ndarray, float, bool, bool]:
@@ -334,8 +412,14 @@ class SFC_HIRL_Env(gym.Env):
             self._apply_deployment(self.current_request, plan)
             self.unadded_dest_indices.remove(goal_dest_idx)
             dest_node = self.current_request['dest'][goal_dest_idx]
-            self.current_tree['paths_map'][dest_node] = plan['new_path_full']
-            self.nodes_on_tree.update(plan['new_path_full'])
+
+            # ----------------------------------------------------
+            # ✅ 修复 #3: 更新路径管理
+            # ----------------------------------------------------
+            new_path = plan['new_path_full']
+            self._add_path_to_tree(new_path)  # 添加到稳定列表
+            self.current_tree['paths_map'][dest_node] = new_path
+            self.nodes_on_tree.update(new_path)
 
             sub_task_done = True
             if not self.unadded_dest_indices:
