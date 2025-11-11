@@ -33,19 +33,7 @@ def parse_mat_request(req_obj) -> Dict:
     """
     将 MATLAB 请求结构 (来自 sorted_requests.mat) 解析为 Python 字典
     """
-    # .mat 文件中的 'request' 是一个 1x1 的对象数组
-
-    # ✅ 修正：req_obj 已经是从 1D 数组中取出的单个请求对象
-    # 它就是 req，不需要 [0, 0] 索引
     req = req_obj
-
-    # 提取字段
-    # .source 是 [[uint16]]
-    # .dest 是 [[uint16 uint16 ...]]
-    # .vnf 是 [[uint8 uint8 ...]]
-    # .bw_origin 是 [[float64]]
-    # .cpu_origin 是 [[float64 float64 ...]]
-    # .memory_origin 是 [[float64 float64 ...]]
 
     # 兼容两种您提供的 .mat 结构
     try:
@@ -61,7 +49,6 @@ def parse_mat_request(req_obj) -> Dict:
             'leave_time': int(req['leave_time'][0, 0]),
         }
     except (IndexError, TypeError):
-        # 兼容您在 (user script, line 13-24) 中提供的版本
         parsed = {
             'id': int(req[0][0][0]),
             'source': int(req[0][1][0]),
@@ -107,6 +94,10 @@ class MSFCE_Solver:
         return lid - 1, link_map
 
     def _get_path_from_db(self, src: int, dst: int, k: int):
+        """✅ 修复: 添加输入验证"""
+        if src < 1 or dst < 1 or src > self.node_num or dst > self.node_num:
+            return [], 0, []
+
         try:
             p = self.path_db[src - 1, dst - 1]
             dist = int(p['pathsdistance'][k - 1][0])
@@ -176,15 +167,184 @@ class MSFCE_Solver:
 
     def _calc_eval1(self, d_idx: int, k: int, i_idx: int, tree1_path: List[int],
                     request: Dict, tree1_hvt: np.ndarray, state: Dict, nodes_on_tree: Set[int]):
-        """评估新树枝 (连接点->d)"""
-        # ... (实现同您的代码,为简洁省略) ...
-        pass  # 这里使用您原始的 _calc_eval1 实现
+        """
+        评估从树上第 i_idx 个节点到目的节点 d_idx 的第 k 条路径
+        ✅ 修复版本
+        """
+        hvt = tree1_hvt.copy()
+        tree = np.zeros(self.link_num)
+        tree_paths = tree1_path[:i_idx + 1]
+        feasible = True
+        infeasible_dest = 0
+
+        # 获取连接点和目的节点
+        connect_node = tree1_path[i_idx]
+        dest_node = request['dest'][d_idx]
+
+        # ===== 步骤 1: 获取连接点 -> 目的节点的第 k 条路径 =====
+        paths, dist, links = self._get_path_from_db(connect_node, dest_node, k)
+
+        # ✅ 修复: 检查路径长度
+        if not paths or len(paths) < 2:
+            return 0, [], tree, hvt, False, dest_node
+
+        # ===== 步骤 2: 检测环路 (三种情况) =====
+        arr1 = set(paths[1:])
+        arr2 = set(tree_paths)
+        if arr1 & arr2:
+            return 0, paths, tree, hvt, False, dest_node
+
+        arr4 = nodes_on_tree - set(tree_paths)
+        if arr1 & arr4:
+            return 0, paths, tree, hvt, False, dest_node
+
+        if i_idx + 1 < len(tree1_path):
+            arr6 = set(tree1_path[i_idx + 1:])
+            if arr1 & arr6:
+                return 0, paths, tree, hvt, False, dest_node
+
+        # ===== 步骤 3: 统计路径上的可用 DC 节点 =====
+        usable_on_path = [n for n in paths[1:] if n in self.DC]
+        deployed_on_path = [n for n in tree_paths if n in self.DC]
+
+        # ===== 步骤 4: 检查带宽资源 =====
+        for lid in links:
+            if state['bw'][lid - 1] < request['bw_origin']:
+                return 0, paths, tree, hvt, False, dest_node
+
+        # ===== 步骤 5: 计算路径资源 (用于评分) =====
+        CPU_status = sum(state['cpu'][n - 1] for n in paths[1:] if n in self.DC)
+        Memory_status = sum(state['mem'][n - 1] for n in paths[1:] if n in self.DC)
+        Bandwidth_status = sum(state['bw'][lid - 1] for lid in links)
+
+        # ===== 步骤 6: 计算已部署的 VNF 数量 =====
+        # ✅ 修复: 只统计请求需要的 VNF 类型
+        shared_path_deployed = sum(
+            1 for vnf_type in request['vnf']
+            if any(hvt[n - 1, vnf_type - 1] > 0 for n in deployed_on_path)
+        )
+        undeployed_vnf = len(request['vnf']) - shared_path_deployed
+
+        # ===== 步骤 7: VNF 部署检查 =====
+        if undeployed_vnf == 0:
+            # 所有 VNF 已在共享路径上部署
+            eval_score = self._calc_score(
+                connect_node, dest_node, dist,  # ✅ 修复: 传入正确的 src/dst
+                len(deployed_on_path), CPU_status, Memory_status, Bandwidth_status
+            )
+            for lid in links:
+                tree[lid - 1] = 1
+            return eval_score, paths, tree, hvt, True, 0
+
+        else:
+            # 需要在新路径上部署 VNF
+            if len(usable_on_path) < undeployed_vnf:
+                return 0, paths, tree, hvt, False, dest_node
+
+            # 尝试部署未部署的 VNF
+            j = shared_path_deployed
+            g = 0
+
+            while j < len(request['vnf']) and g < len(usable_on_path):
+                node_idx = usable_on_path[g] - 1
+                vnf_type = request['vnf'][j] - 1
+
+                if hvt[node_idx, vnf_type] == 0:
+                    if (state['cpu'][node_idx] < request['cpu_origin'][j] or
+                            state['mem'][node_idx] < request['memory_origin'][j]):
+                        g += 1
+                        continue
+
+                hvt[node_idx, vnf_type] = 1
+                j += 1
+                g += 1
+
+            # ✅ 修复: 检查是否所有 VNF 都部署成功
+            usable_path_deployed = sum(
+                1 for vnf_type in request['vnf']
+                if any(hvt[n - 1, vnf_type - 1] > 0 for n in usable_on_path)
+            )
+
+            # ✅ 修复: 应该与总需求数比较
+            total_deployed = sum(
+                1 for vnf_type in request['vnf']
+                if any(hvt[n - 1, vnf_type - 1] > 0 for n in (deployed_on_path + usable_on_path))
+            )
+
+            if total_deployed != len(request['vnf']):
+                return 0, paths, tree, hvt, False, dest_node
+
+            eval_score = self._calc_score(
+                connect_node, dest_node, dist,  # ✅ 修复: 传入正确的 src/dst
+                len(usable_on_path), CPU_status, Memory_status, Bandwidth_status
+            )
+            for lid in links:
+                tree[lid - 1] = 1
+
+            return eval_score, paths, tree, hvt, True, 0
+
+    def _calc_score(self, src: int, dst: int, dist: int, dc_count: int,
+                    cpu_sum: float, mem_sum: float, bw_sum: float) -> float:
+        """✅ 修复: 计算评分函数，传入正确的 src/dst"""
+        max_dist = self._get_kth_path_max_distance(src, dst, self.k_path_count) or 1
+
+        score = (
+                (1 - dist / max_dist) +
+                dc_count / self.dc_num +
+                cpu_sum / (self.cpu_capacity * self.dc_num) +
+                mem_sum / (self.memory_capacity * self.dc_num) +
+                bw_sum / (self.bandwidth_capacity * self.link_num)
+        )
+        return score
 
     def _calc_atnp(self, tree1: Dict, tree1_path: List[int], d_idx: int,
                    state: Dict, nodes_on_tree: Set[int]):
-        """找到最佳连接点"""
-        # ... (实现同您的代码,为简洁省略) ...
-        pass  # 这里使用您原始的 _calc_atnp 实现
+        """
+        找到将目的节点 d 连接到树 tree1 的最佳方案
+        """
+        request = state['request']
+
+        # 如果上一个树不可行，直接返回
+        if tree1.get('eval', 0) == 0:
+            return {
+                'tree': tree1['tree'].copy(),
+                'hvt': tree1['hvt'].copy(),
+                'feasible': tree1.get('feasible', False),
+                'infeasible_dest': tree1.get('infeasible_dest', 0)
+            }, 0
+
+        # ===== 遍历树上的所有可能连接点 =====
+        best_eval = -1
+        best_plan = None
+
+        for i_idx in range(len(tree1_path)):
+            for k in range(1, self.k_path_count + 1):
+                eval_val, paths, tree_new, hvt_new, feasible, infeasible_dest = \
+                    self._calc_eval1(
+                        d_idx, k, i_idx, tree1_path, request,
+                        tree1['hvt'], state, nodes_on_tree
+                    )
+
+                if feasible and eval_val > best_eval:
+                    best_eval = eval_val
+                    best_plan = {
+                        'tree': tree_new,
+                        'hvt': hvt_new,
+                        'new_path_full': paths,
+                        'connect_idx': i_idx,
+                        'feasible': True,
+                        'infeasible_dest': 0
+                    }
+
+        if best_plan is None:
+            return {
+                'tree': tree1['tree'].copy(),
+                'hvt': tree1['hvt'].copy(),
+                'feasible': False,
+                'infeasible_dest': request['dest'][d_idx]
+            }, 0
+
+        return best_plan, best_eval
 
     def solve_request(self, request: Dict, network_state: Dict) -> Optional[Dict]:
         """部署请求 (返回部署方案或 None)"""
@@ -232,18 +392,27 @@ class MSFCE_Solver:
             if best_d == -1:
                 return None
 
-            current_tree['tree'] = np.logical_or(current_tree['tree'], best_plan['tree']).astype(float)
-            current_tree['hvt'] = np.logical_or(current_tree['hvt'], best_plan['hvt']).astype(float)
+            # ✅ 修复: 树结构合并
+            current_tree['tree'] = np.logical_or(
+                current_tree['tree'],
+                best_plan['tree']
+            ).astype(float)
+
+            # ✅ 修复: hvt 使用 maximum 而非 logical_or (保留引用计数信息)
+            current_tree['hvt'] = np.maximum(
+                current_tree['hvt'],
+                best_plan['hvt']
+            )
+
             current_tree['paths_map'][request['dest'][best_d]] = best_plan['new_path_full']
             nodes_on_tree.update(best_plan['new_path_full'])
             unadded.remove(best_d)
 
-        # ✅ 修复: 计算带宽成本 (只计算新占用的链路)
+        # 计算资源成本
         used_links = np.where(current_tree['tree'] > 0)[0]
         new_links_mask = (network_state['bw_ref_count'][used_links] == 0)
         bw_cost = np.sum(new_links_mask) * request['bw_origin']
 
-        # 计算 VNF 成本 (只计算新部署的)
         cpu_cost, mem_cost = 0, 0
         for node, vnf_t in np.argwhere(current_tree['hvt'] > 0):
             if network_state['hvt'][node, vnf_t] == 0:
@@ -323,7 +492,7 @@ class DynamicSimulator:
         }
 
     def _handle_leave_event(self, t: int, leave_ids: np.ndarray):
-        """处理离开事件 (使用引用计数释放资源)"""
+        """✅ 修复: 处理离开事件"""
         if leave_ids.size == 0:
             return
 
@@ -342,17 +511,17 @@ class DynamicSimulator:
                             if self.link_ref_count[link_idx] == 0:
                                 self.B[t, link_idx] += req['bw_origin']
 
-                    # 释放 VNF
+                    # ✅ 修复: 释放 VNF (处理可能的重复类型)
                     for node, vnf_t in np.argwhere(tree['hvt'] > 0):
                         if self.hvt_all[node, vnf_t] > 0:
                             self.hvt_all[node, vnf_t] -= 1
                             if self.hvt_all[node, vnf_t] == 0:
-                                try:
-                                    j = req['vnf'].index(vnf_t + 1)
+                                # 找到对应的资源量 (只释放一次)
+                                vnf_type_to_find = vnf_t + 1
+                                if vnf_type_to_find in req['vnf']:
+                                    j = req['vnf'].index(vnf_type_to_find)
                                     self.C[t, node] += req['cpu_origin'][j]
                                     self.M[t, node] += req['memory_origin'][j]
-                                except ValueError:
-                                    pass
                 except StopIteration:
                     print(f"⚠️ 找不到 ID={req['id']} 的树")
             else:
@@ -420,7 +589,6 @@ class DynamicSimulator:
             self.logs['memory_resource_comp'][t] = self.temp_step_costs['mem']
             self.logs['bandwidth_resource_comp'][t] = self.temp_step_costs['bw']
 
-        # ✅ 修复: 使用 self.solver.xxx_capacity
         cpu_load_t = 1 - (self.C[t] / self.solver.cpu_capacity)
         self.logs['cpu_load_var'][t] = np.var(cpu_load_t[self.dc_nodes_0based])
 
@@ -435,7 +603,6 @@ class DynamicSimulator:
 
     def _save_results(self):
         """保存结果到 .mat 文件"""
-        # ✅ 修复: 使用 self.output_dir (不是 self.output)
         print(f"保存结果到 {self.output_dir}")
         try:
             if not self.output_dir.exists():
@@ -555,8 +722,8 @@ if HAS_DRL:
             return self._get_state()
 
         def step(self, action: int):
-            """执行一个动作"""
-            # ✅ 修复: 自动跳过空时间步
+            """✅ 修复: 执行一个动作"""
+            # 自动跳过空时间步
             while len(self.pending_requests) == 0:
                 self.t += 1
 
@@ -574,7 +741,7 @@ if HAS_DRL:
                 self.pending_requests = list(self.sim.events[self.t]['arrive'])
                 self.sim.arrived += len(self.pending_requests)
 
-            # ✅ 修复: 检查非法动作
+            # 检查非法动作
             if action >= len(self.pending_requests):
                 return self._get_state(), -10.0, False, {"error": "Invalid action"}
 
@@ -585,7 +752,7 @@ if HAS_DRL:
             req = self.sim.req_map[req_id]
             plan = self.sim.solver.solve_request(req, self.sim.get_state(self.t))
 
-            # ✅ 修复: 归一化奖励
+            # 归一化奖励
             if plan is None:
                 reward = -100.0
                 self.sim.block += 1
@@ -598,8 +765,9 @@ if HAS_DRL:
                 norm_cost = cost / self.MAX_COST
                 reward = 1.0 - norm_cost
 
-            # ✅ 修复: 只有 T 结束时才返回 done=True
-            done = False
+            # ✅ 修复: 正确设置 done 标志
+            done = (self.t >= self.sim.T - 1 and len(self.pending_requests) == 0)
+
             return self._get_state(), reward, done, {}
 
         def render(self, mode='human'):
@@ -661,13 +829,44 @@ def train_drl(input_dir: Path, output_dir: Path, topo: np.ndarray,
     print("\n--- 评估模型 ---")
     obs = vec_env.reset()
     episode_reward = 0
-
     done = False
+
+    # --- 新增: 导入 tqdm ---
+    # (请确保您在文件顶部导入了: from tqdm import tqdm)
+    from tqdm import tqdm
+
+    # --- 新增: 从环境中获取总时间步长 T ---
+    # (我们假设 T 在您的环境中是 721)
+    try:
+        sim_T = vec_env.envs[0].sim.T
+    except AttributeError:
+        print("警告：无法自动获取 sim.T，进度条最大值将设为默认值 (721)")
+        sim_T = 721  # 备用值
+
+    # --- 新增: 初始化 tqdm 进度条 ---
+    pbar = tqdm(total=sim_T, desc="评估进度")
+    last_t = 0  # 跟踪上一个时间步
+
     while not done:
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, done, info = vec_env.step(action)
         episode_reward += reward[0]
 
+        # --- 新增: 更新进度条 ---
+        # 1. 从环境中获取当前模拟时间
+        current_t = vec_env.envs[0].t
+
+        # 2. 检查时间是否推进
+        if current_t > last_t:
+            pbar.update(current_t - last_t)  # 按实际跳过的时间步更新
+            last_t = current_t
+
+    # --- 新增: 确保进度条在循环结束时关闭 ---
+    if pbar.n < sim_T:  # 补全剩余进度
+        pbar.update(sim_T - pbar.n)
+    pbar.close()
+
+    # --- 原始代码继续 ---
     final_sim = vec_env.envs[0].sim
     final_br = final_sim.block / final_sim.arrived if final_sim.arrived > 0 else 0
 
@@ -676,7 +875,6 @@ def train_drl(input_dir: Path, output_dir: Path, topo: np.ndarray,
 
     # 保存仿真日志
     final_sim._save_results()
-
 
 def main():
     """主函数"""
