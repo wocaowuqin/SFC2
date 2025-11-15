@@ -385,6 +385,9 @@ class MSFCE_Solver:
         tree_set = []
         best_k_set = []
         best_cost_set = []
+
+        # ✅ 新增: 跟踪可行的目的地
+        feasible_dests = []
         for d_idx in range(dest_num):
             best_eval, best_result, best_k, best_cost = -1, None, 0, 0
             for k in range(1, self.k_path_count + 1):
@@ -398,7 +401,13 @@ class MSFCE_Solver:
             tree_set.append(best_result if best_result else {'eval': -1})
             best_k_set.append(best_k)
             best_cost_set.append(best_cost)
-
+        # 新增: 标记可行的目的地
+            if best_result and best_result.get('eval', -1) > 0:
+                feasible_dests.append(d_idx)
+        # 修复: 如果没有可行的目的地,返回空解
+        if not feasible_dests:
+            print(f"⚠️ 请求 {request['id']} 的所有目的地都不可行 (DC节点不足)")
+            return None, []
         # 贪心构建多播树
         best_d_idx = np.argmax([t.get('eval', -1) for t in tree_set])
         if tree_set[best_d_idx]['eval'] <= 0:

@@ -285,95 +285,155 @@ def main_improved():
 
         # --- 4. 阶段 1: 模仿学习 (预训练) ---
         logger.info(f"--- 3. 阶段 1: 模仿学习预训练 ( {H.PRE_TRAIN_STEPS} 步) ---")
-        # (我们假设 PRE_TRAIN_STEPS 已被设置为一个合理的值, e.g., 200)
+        # ✅ 新增: 初始化跟踪字典
+        tracking_data_pretrain = {
+            'step': [],
+            'requests_completed': [],
+            'memory_size': [],
+            'epsilon': []
+        }
         stepCount = 0
         current_request, high_level_state = env.reset_request()
 
-        t = 0
-        failed_requests = 0  # (补丁 4)
+        # ✅ 新增: 跟踪统计
+        pretrain_complete_requests = 0
+        pretrain_partial_requests = 0
 
-        while t < H.PRE_TRAIN_STEPS:
-            try:  # (补丁 4)
+        while stepCount < H.PRE_TRAIN_STEPS:
+            try:
+                # 1. 检查是否有请求
                 if current_request is None:
                     current_request, high_level_state = env.reset_request()
                     if current_request is None:
-                        logger.warning("没有更多请求,提前结束预训练")  # (Emoji removed)
+                        logger.warning("没有更多请求,提前结束预训练")
                         break
                     continue
 
-                # 获取专家轨迹
+                # 2. 获取专家完整轨迹
                 try:
                     _, expert_traj = env.expert.solve_request_for_expert(
                         current_request, env._get_network_state_dict()
                     )
                 except Exception as e:
                     logger.error(f"专家求解失败: {e}")
-                    failed_requests += 1
                     current_request, high_level_state = env.reset_request()
                     continue
 
+                # 3. 检查轨迹是否为空
                 if not expert_traj:
-                    failed_requests += 1
-                    if failed_requests % 100 == 0:
-                        logger.warning(f"警告: 已有 {failed_requests} 个请求失败")  # (Emoji removed)
+                    pretrain_partial_requests += 1
+                    logger.debug(f"请求 {current_request['id']} 无法完全求解,跳过")
                     current_request, high_level_state = env.reset_request()
                     continue
 
-                failed_requests = 0  # 重置失败计数
+                # ============================================
+                # ✅ 关键修复: 执行完整的专家轨迹
+                # ============================================
+                request_completed_successfully = False
 
-                # 遍历专家轨迹的所有步骤
                 for step_idx, (exp_goal, exp_action_tuple, exp_cost) in enumerate(expert_traj):
+                    # 检查目标是否仍然有效
                     if exp_goal not in env.unadded_dest_indices:
+                        logger.warning(f"步骤 {step_idx}: 目标 {exp_goal} 已完成或无效,跳过")
                         continue
 
+                    # 解码动作
                     exp_action = exp_action_tuple[0] * env.K_path + exp_action_tuple[1]
 
-                    # 在环境中执行
-                    next_high_level_state, cost, sub_task_done, request_done = env.step_low_level(exp_goal, exp_action)
+                    # 执行动作
+                    next_high_level_state, cost, sub_task_done, request_done = \
+                        env.step_low_level(exp_goal, exp_action)
 
-                    # 存储
-                    reward = low_level_agent.criticize(sub_task_completed=True, cost=cost, request_failed=False)
+                    # 计算奖励
+                    reward = low_level_agent.criticize(
+                        sub_task_completed=sub_task_done,
+                        cost=cost,
+                        request_failed=False
+                    )
+
+                    # 存储经验
                     goal_one_hot = to_categorical(exp_goal, num_classes=NB_GOALS)
-                    exp = ActorExperience(high_level_state, goal_one_hot, exp_action, reward, next_high_level_state,
-                                          sub_task_done)
+                    exp = ActorExperience(
+                        high_level_state, goal_one_hot, exp_action,
+                        reward, next_high_level_state, sub_task_done
+                    )
                     low_level_agent.store(exp)
 
                     # 训练
-                    if t % low_level_agent.trainFreq == 0:
-                        low_level_agent.update(t)
+                    if stepCount % low_level_agent.trainFreq == 0:
+                        low_level_agent.update(stepCount)
 
                     metacontroller.collect(high_level_state, exp_goal)
-                    if t % H.META_TRAIN_FREQ == 0 and metacontroller.check_training_clock():
+                    if stepCount % H.META_TRAIN_FREQ == 0 and metacontroller.check_training_clock():
                         metacontroller.train()
 
+                    # 更新状态
                     high_level_state = next_high_level_state
-                    t += 1
+                    stepCount += 1
 
-                    if t % 1000 == 0:
-                        logger.info(f"预训练... {t}/{H.PRE_TRAIN_STEPS}")
-
-                    if t >= H.PRE_TRAIN_STEPS:  # 确保我们不会超出步数限制
+                    # ✅ 关键: 打印进度 (每100步)
+                    if stepCount % 100 == 0:
+                        logger.info(
+                            f"预训练进度: {stepCount}/{H.PRE_TRAIN_STEPS} "
+                            f"| 完整请求: {pretrain_complete_requests} "
+                            f"| 部分请求: {pretrain_partial_requests} "
+                            f"| Epsilon: {low_level_agent.controllerEpsilon:.4f}"
+                        )
+                        # ✅ 新增: 记录跟踪数据
+                        tracking_data_pretrain['step'].append(stepCount)
+                        tracking_data_pretrain['requests_completed'].append(pretrain_complete_requests)
+                        tracking_data_pretrain['memory_size'].append(len(low_level_agent.memory))
+                        tracking_data_pretrain['epsilon'].append(low_level_agent.controllerEpsilon)
+                    # 检查是否达到步数限制
+                    if stepCount >= H.PRE_TRAIN_STEPS:
+                        logger.info("达到预训练步数限制")
                         break
 
+                    # ✅ 关键: 只有在完成整个请求后才重置
                     if request_done:
+                        request_completed_successfully = True
+                        logger.debug(
+                            f"请求 {current_request['id']} 完成 "
+                            f"(轨迹长度: {len(expert_traj)}, 执行步数: {step_idx + 1})"
+                        )
                         break
 
-                # 预训练循环后重置请求
+                # 4. 记录请求完成状态
+                if request_completed_successfully:
+                    pretrain_complete_requests += 1
+                else:
+                    pretrain_partial_requests += 1
+
+                # 5. 重置到下一个请求
                 current_request, high_level_state = env.reset_request()
 
             except Exception as e:
                 logger.error(f"预训练循环出错: {e}")
+                import traceback
                 traceback.print_exc()
-                # 尝试恢复
                 current_request, high_level_state = env.reset_request()
                 continue
 
-        logger.info(f"预训练完成: {t} 步, {failed_requests} 个失败请求")
-
+        # 打印预训练总结
+        logger.info(f"预训练完成:")
+        logger.info(f"  总步数: {stepCount}")
+        logger.info(f"  完整请求: {pretrain_complete_requests}")
+        logger.info(f"  部分请求: {pretrain_partial_requests}")
+        logger.info(f"  经验缓冲区大小: {len(low_level_agent.memory)}")
+        # ✅ 新增: 在预训练结束后保存
+        try:
+            df_pretrain = pd.DataFrame(tracking_data_pretrain)
+            # 假设 H.OUTPUT_DIR 是一个 Pathlib 对象
+            output_path = H.OUTPUT_DIR / "pretrain_metrics.csv"
+            df_pretrain.to_csv(output_path, index=False)
+            logger.info(f"预训练指标已保存到: {output_path}")
+        except Exception as e:
+            logger.warning(f"保存预训练指标失败: {e}")
         # --- 4. 阶段 2: 混合 IL/RL 训练 ---
         logger.info("--- 4. 阶段 2: 混合 IL/RL 训练 ---")
         low_level_agent.randomPlay = False
-        stepCount = t  # 从预训练的步数继续
+        stepCount = stepCount  # 从预训练的步数继续
+        logger.info(f"从预训练步数 {stepCount} 继续...")
         episodeCount = 0
         # total_requests_arrived = 0 (已在 env 中)
         # total_requests_served = 0 (已在 env 中)
@@ -414,7 +474,14 @@ def main_improved():
                         continue
 
                     goal_one_hot = np.reshape(to_categorical(goal, num_classes=NB_GOALS), (1, -1))
-
+                    # ✅ 新增: 检查是否因时间耗尽而未完成
+                    if env.t >= env.T and env.unadded_dest_indices:
+                        logger.warning(
+                            f"请求 {current_request['id']} 因仿真时间耗尽而未完成。"
+                            f"剩余 {len(env.unadded_dest_indices)} 个目的地。"
+                        )
+                        request_done = True  # 强制结束
+                        break
                     # --- B. 低层执行 (代理) ---
                     sub_task_done = False
                     low_level_state = high_level_state

@@ -75,7 +75,15 @@ class SFC_HIRL_Env(gym.Env):
 
         self.expert = MSFCE_Solver(input_dir / "US_Backbone_path.mat", topo, dc_nodes, capacities)
 
-        self.T = 400  # 总时间步
+        # ✅ 修复: 动态计算仿真时间
+        # 方案1: 使用事件数量
+        try:
+            events_mat = sio.loadmat(input_dir / "event_list.mat")['event_list']
+            self.T = events_mat.shape[0]  # ✅ 使用实际事件数量 (721)
+            print(f"✅ 仿真时间步数: {self.T}")
+        except:
+            self.T = 1000  # 兜底值
+
         self.n, self.L, self.K_vnf = self.expert.node_num, self.expert.link_num, self.expert.type_num
         self.K_path = self.expert.k_path_count
 

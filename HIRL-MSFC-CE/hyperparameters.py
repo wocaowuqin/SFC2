@@ -10,9 +10,9 @@ INPUT_DIR = Path('E:/pycharmworkspace/SFC-master/HIRL-MSFC-CE/mat')
 OUTPUT_DIR = Path('E:/pycharmworkspace/SFC-master/HIRL-MSFC-CE/out_hirl')
 
 CAPACITIES = {
-    'cpu': 200.0,
-    'memory': 110.0,
-    'bandwidth': 50.0
+    'cpu': 2000.0,
+    'memory': 1100.0,
+    'bandwidth': 500.0
 }
 
 DC_NODES = [1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 14, 17, 18, 19, 20, 21, 23, 24, 27, 28]
@@ -78,8 +78,8 @@ TOPOLOGY_MATRIX = np.array([
 ])
 
 # --- 2. 训练超参数 ---
-PRE_TRAIN_STEPS = 100   # 阶段1: 纯模仿学习步数
-EPISODE_LIMIT = 300      # 阶段2: 总训练回合数
+PRE_TRAIN_STEPS = 2000   # 阶段1: 纯模仿学习步数
+EPISODE_LIMIT = 800      # 阶段2: 总训练回合数
 STEPS_LIMIT = 2000000     # 总步数限制
 BATCH_SIZE = 32
 GAMMA = 0.99
