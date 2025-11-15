@@ -41,30 +41,13 @@ class MetaControllerNN:
         self.meta_controller = self._build_model()
         self.meta_controller.compile(loss='categorical_crossentropy', optimizer=rmsProp)
 
-    # def _build_model(self):
-    #     """H-DQN 架构: 输入 = (State, Goal), 输出 = Q(State, Goal, Action)"""
-    #     state_input = Input(shape=self.state_shape, name='state_input')
-    #     goal_input = Input(shape=(self.n_goals,), name='goal_input')
-    #
-    #     merged_input = concatenate([state_input, goal_input])
-    #
-    #     x = Dense(256, activation='relu')(merged_input)
-    #     x = Dense(256, activation='relu')(x)
-    #     output = Dense(self.n_actions, activation='linear', name='q_values')(x)
-    #
-    #     model = Model(inputs=[state_input, goal_input], outputs=output)
-    #
-    #     # ✅ 修复：在这里定义 optimizer
-    #     rmsProp = optimizers.RMSprop(learning_rate=self.lr, rho=0.95, epsilon=1e-08)
-    #
-    #     model.compile(loss='mse', optimizer=rmsProp)
-    #     return model
     def _build_model(self):
         model = Sequential()
         model.add(Dense(256, activation='relu', input_shape=self.state_shape))
         model.add(Dense(256, activation='relu'))
         model.add(Dense(self.n_goals, activation='softmax'))  # ✅ 正确: 输出 n_goals
         return model
+
     def check_training_clock(self):
         return (self.count >= 100)  # 每100次收集就训练一次
 
@@ -89,8 +72,13 @@ class MetaControllerNN:
         self.meta_controller.fit(train_x, train_y, batch_size=32, epochs=1, verbose=0)
         self.count = 0  # 重置计数器
 
+    # ----------------------------------------------------
+    # ✅ 修复: (补丁 2)
+    # ----------------------------------------------------
     def predict(self, x):
-        return self.meta_controller.predict(x, verbose=0)[0]
+        # ✅ 修复: 确保输入有 batch 维度 (1, dim)
+        x_arr = np.atleast_2d(x.astype(np.float32))
+        return self.meta_controller.predict(x_arr, verbose=0)[0]
 
     def sample(self, prob_vec, temperature=0.1):
         """(来自: meta_net_il.py)"""
@@ -135,6 +123,11 @@ class Hdqn_SFC:
     def saveWeight(self, file_prefix):
         self.controllerNet.save_weights(f"{file_prefix}_controller.weights.h5")
 
+    # ----------------------------------------------------
+    # ✅ 修复 #1: (补丁 1)
+    # ----------------------------------------------------
     def loadWeight(self, file_prefix):
         self.controllerNet.load_weights(f"{file_prefix}_controller.weights.h5")
-        self.controllerNet.reset_states()
+        # ✅ 修复: 同步到 target 网络
+        self.targetControllerNet.set_weights(self.controllerNet.get_weights())
+        print(f"✅ 模型权重已加载: {file_prefix}")

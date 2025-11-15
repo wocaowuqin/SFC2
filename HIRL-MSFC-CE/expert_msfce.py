@@ -52,10 +52,10 @@ class MSFCE_Solver:
         try:
             self.path_db = sio.loadmat(path_db_file)['Paths']
         except FileNotFoundError:
-            print(f"❌ 致命错误: 找不到 MAT 文件 {path_db_file}")
+            print(f"致命错误: 找不到 MAT 文件 {path_db_file}")
             raise
         except KeyError:
-            print(f"❌ 致命错误: MAT 文件 {path_db_file} 中缺少 'Paths' 键")
+            print(f"致命错误: MAT 文件 {path_db_file} 中缺少 'Paths' 键")
             raise
 
         self.node_num = topology_matrix.shape[0]
@@ -67,7 +67,7 @@ class MSFCE_Solver:
         self.memory_capacity = capacities['memory']
         self.bandwidth_capacity = capacities['bandwidth']
         self.link_num, self.link_map = self._create_link_map(topology_matrix)
-        print(f"✅ 专家加载: {self.node_num}节点, {self.link_num}链路, {self.dc_num}DC")
+        print(f"专家加载: {self.node_num}节点, {self.link_num}链路, {self.dc_num}DC")
 
     def _create_link_map(self, topo: np.ndarray) -> Tuple[int, Dict]:
         link_map, lid = {}, 1
@@ -127,25 +127,35 @@ class MSFCE_Solver:
 
         # 检查资源
         if len(usable) < len(request['vnf']):
+            # ✅ 修复: 添加你的 Debug 探针
+            print(
+                f"DEBUG_EVAL FAIL (goal={dest}): Not enough DC nodes on path. Found {len(usable)}, Need {len(request['vnf'])}")
             return 0, path, tree, hvt_new, False, dest, 0
         for lid in links:
             if lid - 1 >= len(bw) or bw[lid - 1] < request['bw_origin']:
+                # ✅ 修复: 添加你的 Debug 探针
+                print(f"DEBUG_EVAL FAIL (goal={dest}): link {lid} bw={bw[lid - 1]} < req_bw={request['bw_origin']}")
                 return 0, path, tree, hvt_new, False, dest, 0
 
         # VNF 放置
         j, i = 0, 0
         while j < len(request['vnf']):
             if i >= len(usable):
+                print(f"DEBUG_EVAL FAIL (goal={dest}): Ran out of usable DC nodes while placing VNF {j}")
                 return 0, path, tree, hvt_new, False, dest, 0
             node, vnf_t = usable[i] - 1, request['vnf'][j] - 1
             if hvt[node, vnf_t] == 0:
                 if cpu[node] < request['cpu_origin'][j] or mem[node] < request['memory_origin'][j]:
+                    # ✅ 修复: 添加你的 Debug 探针
+                    print(
+                        f"DEBUG_EVAL FAIL (goal={dest}): node {node + 1} cpu/mem not enough. Has C={cpu[node]}, M={mem[node]}. Need C={request['cpu_origin'][j]}, M={request['memory_origin'][j]}")
                     i += 1
                     continue
             hvt_new[node, vnf_t] = 1
             j, i = j + 1, i + 1
 
         if np.sum(hvt_new) != len(request['vnf']):
+            print(f"DEBUG_EVAL FAIL (goal={dest}): VNF placement count mismatch.")
             return 0, path, tree, hvt_new, False, dest, 0
 
         for lid in links:
@@ -181,13 +191,16 @@ class MSFCE_Solver:
         arr1 = set(paths[1:])
         arr2 = set(tree_paths)
         if arr1 & arr2:
+            print(f"DEBUG_EVAL1 FAIL (goal={dest_node}): Loop detected (arr1 & arr2)")
             return 0, paths, tree, hvt, False, dest_node, 0
         arr4 = nodes_on_tree - set(tree_paths)
         if arr1 & arr4:
+            print(f"DEBUG_EVAL1 FAIL (goal={dest_node}): Loop detected (arr1 & arr4)")
             return 0, paths, tree, hvt, False, dest_node, 0
         if i_idx + 1 < len(tree1_path):
             arr6 = set(tree1_path[i_idx + 1:])
             if arr1 & arr6:
+                print(f"DEBUG_EVAL1 FAIL (goal={dest_node}): Loop detected (arr1 & arr6)")
                 return 0, paths, tree, hvt, False, dest_node, 0
 
         usable_on_path = [n for n in paths[1:] if n in self.DC]
@@ -195,6 +208,9 @@ class MSFCE_Solver:
 
         for lid in links:
             if lid - 1 >= len(state['bw']) or state['bw'][lid - 1] < request['bw_origin']:
+                # ✅ 修复: 添加你的 Debug 探针
+                print(
+                    f"DEBUG_EVAL1 FAIL (goal={dest_node}): link {lid} bw={state['bw'][lid - 1]} < req_bw={request['bw_origin']}")
                 return 0, paths, tree, hvt, False, dest_node, 0
 
         CPU_status = sum(state['cpu'][n - 1] for n in paths[1:] if n in self.DC)
@@ -218,6 +234,8 @@ class MSFCE_Solver:
             return eval_score, paths, tree, hvt, True, 0, cost
         else:
             if len(usable_on_path) < undeployed_vnf:
+                print(
+                    f"DEBUG_EVAL1 FAIL (goal={dest_node}): Not enough DC nodes on branch. Found {len(usable_on_path)}, Need {undeployed_vnf}")
                 return 0, paths, tree, hvt, False, dest_node, 0
 
             j, g = shared_path_deployed, 0
@@ -227,6 +245,9 @@ class MSFCE_Solver:
                 if hvt[node_idx, vnf_type] == 0:
                     if (state['cpu'][node_idx] < request['cpu_origin'][j] or
                             state['mem'][node_idx] < request['memory_origin'][j]):
+                        # ✅ 修复: 添加你的 Debug 探针
+                        print(
+                            f"DEBUG_EVAL1 FAIL (goal={dest_node}): node {node_idx + 1} cpu/mem not enough. Has C={state['cpu'][node_idx]}, M={state['mem'][node_idx]}. Need C={request['cpu_origin'][j]}, M={request['memory_origin'][j]}")
                         g += 1
                         continue
                 hvt[node_idx, vnf_type] = 1
@@ -238,6 +259,8 @@ class MSFCE_Solver:
                 if any(hvt[n - 1, vnf_type - 1] > 0 for n in (deployed_on_path + usable_on_path))
             )
             if total_deployed != len(request['vnf']):
+                print(
+                    f"DEBUG_EVAL1 FAIL (goal={dest_node}): VNF placement count mismatch. Deployed {total_deployed}, Need {len(request['vnf'])}")
                 return 0, paths, tree, hvt, False, dest_node, 0
 
             eval_score = self._calc_score(
@@ -250,7 +273,7 @@ class MSFCE_Solver:
             return eval_score, paths, tree, hvt, True, 0, cost
 
     # ----------------------------------------------------
-    # ✅ 修复 #1: 替换为您的新 _calculate_cost 方法
+    # 修复 #1: 替换为您的新 _calculate_cost 方法
     # ----------------------------------------------------
     def _calculate_cost(self, request: Dict, state: Dict, tree: np.ndarray, hvt: np.ndarray) -> float:
         """计算部署此方案的资源成本 (用于RL奖励)"""
@@ -258,7 +281,8 @@ class MSFCE_Solver:
 
         used_links = np.where(tree > 0)[0]
         if used_links.size > 0:
-            new_links_mask = (state['bw_ref_count'][used_links] == 0)
+            bw_ref_count = state.get('bw_ref_count', np.zeros(self.link_num))  # 安全获取
+            new_links_mask = (bw_ref_count[used_links] == 0)
             bw_cost = np.sum(new_links_mask) * request['bw_origin']
 
         for node, vnf_t in np.argwhere(hvt > 0):
@@ -270,7 +294,7 @@ class MSFCE_Solver:
                 except ValueError:
                     pass
 
-        # ✅ 修复: 定义归一化权重
+        # 修复: 定义归一化权重
         # 权重设计原则:
         # - 带宽是共享资源，权重较低
         # - CPU和内存是节点独占资源，权重较高
@@ -396,22 +420,17 @@ class MSFCE_Solver:
         unadded = set(range(dest_num)) - {best_d_idx}
 
         # ----------------------------------------------------
-        # ✅ 修复 #4: (方案 2) 模拟状态更新
+        # 修复 #3: (补丁 3)
         # ----------------------------------------------------
 
-        # 备份原始状态，以便函数退出时恢复
-        # 注意：我们只备份引用类型（数组），值类型（如 link_ref_count）不需要
-        # （但 network_state 并没有包含 link_ref_count... 这是一个潜在问题，
-        # 专家目前没有考虑 ref_count。为保持与您代码一致，我们只备份传入的）
-
-        # 拷贝 network_state 字典中的数组，以进行本地修改
+        # 创建局部状态副本 (已应用补丁 3)
         local_network_state = {
             'bw': network_state['bw'].copy(),
             'cpu': network_state['cpu'].copy(),
             'mem': network_state['mem'].copy(),
             'hvt': network_state['hvt'].copy(),
-            'bw_ref_count': network_state['bw_ref_count'].copy(),  # 假设 ref_count 也传入
-            'request': request  # request 是共享的
+            'bw_ref_count': network_state.get('bw_ref_count', np.zeros(len(network_state['bw']))).copy(),
+            'request': request
         }
 
         while unadded:
@@ -422,14 +441,15 @@ class MSFCE_Solver:
                 for conn_path in current_tree['paths_map'].values():
                     t, m, action, cost = self._calc_atnp(
                         {'tree': current_tree['tree'].copy(), 'hvt': current_tree['hvt'].copy()},
-                        conn_path, d_idx, local_network_state, nodes_on_tree  # ✅ 使用本地状态
+                        conn_path, d_idx, local_network_state, nodes_on_tree  # 使用本地状态
                     )
                     if t.get('feasible') and m > best_eval:
                         best_eval, best_plan, best_d = m, t, d_idx
                         best_action, best_cost = action, cost
 
             if best_d == -1:
-                return None, []  # 阻塞
+                # 修复: (方案 2) 停止尝试分支，但返回已经成功的主干轨迹
+                break  # 阻塞
 
             # 记录后续的高层和低层决策
             high_level_goal = best_d
@@ -444,7 +464,7 @@ class MSFCE_Solver:
             nodes_on_tree.update(best_plan['new_path_full'])
             unadded.remove(best_d)
 
-            # ✅ 修复 #4: 临时在 local_network_state 上应用资源变化
+            # 修复 #4: 临时在 local_network_state 上应用资源变化
             for link_idx in np.where(best_plan['tree'] > 0)[0]:
                 if local_network_state['bw_ref_count'][link_idx] == 0:
                     local_network_state['bw'][link_idx] -= request['bw_origin']
@@ -458,6 +478,7 @@ class MSFCE_Solver:
                         local_network_state['mem'][node] -= request['memory_origin'][j]
                     except ValueError:
                         pass
+                # 修复 #3 (补丁 3): 确保 HVT 是累加的
                 local_network_state['hvt'][node, vnf_t] += 1
 
         return current_tree, expert_trajectory

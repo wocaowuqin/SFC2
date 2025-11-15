@@ -14,6 +14,56 @@ from gym import spaces
 from expert_msfce import MSFCE_Solver, parse_mat_request
 
 
+# ----------------------------------------------------
+# 修复 #5: (补丁 5) 添加 PathManager
+# ----------------------------------------------------
+class PathManager:
+    """独立的路径管理器,确保一致性"""
+
+    def __init__(self, max_paths=10):
+        self.max_paths = max_paths
+        self.paths = []  # List[List[int]]
+        self.path_to_idx = {}  # Dict[tuple, int]
+
+    def add_path(self, path: List[int]) -> int:
+        """添加路径并返回索引"""
+        path_tuple = tuple(path)
+
+        # 如果已存在,返回现有索引
+        if path_tuple in self.path_to_idx:
+            return self.path_to_idx[path_tuple]
+
+        # 如果未满,添加新路径
+        if len(self.paths) < self.max_paths:
+            idx = len(self.paths)
+            self.paths.append(path)
+            self.path_to_idx[path_tuple] = idx
+            return idx
+
+        # 如果已满,返回 -1 表示失败 (或返回第一个,取决于策略)
+        # return -1
+        # 返回 0 (索引0) 作为安全兜底
+        return 0
+
+    def get_path(self, idx: int) -> Optional[List[int]]:
+        """安全获取路径"""
+        if 0 <= idx < len(self.paths):
+            return self.paths[idx]
+        return None
+
+    def get_all_paths(self) -> List[List[int]]:
+        """获取所有路径"""
+        return self.paths.copy()
+
+    def reset(self):
+        """重置管理器"""
+        self.paths.clear()
+        self.path_to_idx.clear()
+
+    def __len__(self):
+        return len(self.paths)
+
+
 class SFC_HIRL_Env(gym.Env):
     """
     分层SFC环境。
@@ -53,10 +103,10 @@ class SFC_HIRL_Env(gym.Env):
                     'leave': events_mat[t_idx, 0]['leave_event'].flatten().astype(int)
                 })
         except FileNotFoundError:
-            print(f"❌ 致命错误: 找不到 {input_dir} 下的 .mat 数据文件")
+            print(f"致命错误: 找不到 {input_dir} 下的 .mat 数据文件")
             raise
         except Exception as e:
-            print(f"❌ 致命错误: 加载 .mat 文件失败: {e}")
+            print(f"致命错误: 加载 .mat 文件失败: {e}")
             raise
 
         # HIRL 状态
@@ -67,18 +117,6 @@ class SFC_HIRL_Env(gym.Env):
         self.nodes_on_tree: Set[int] = set()
         self.served_requests = []  # (req, plan)
 
-        # ----------------------------------------------------
-        # ✅ 修复 #3: 新增: 稳定的路径索引管理
-        # ----------------------------------------------------
-        self.tree_path_list: List[List[int]] = []  # 有序路径列表
-        self.tree_path_to_idx: Dict[tuple, int] = {}  # 路径 -> 索引映射
-
-        # 定义状态和动作空间
-        # 状态 = (CPU 负载, Mem 负载, BW 负载, HVT 状态) + (请求信息)
-        state_size = self.n + self.n + self.L + (self.n * self.K_vnf)
-        req_size = 10  # 简化的请求特征向量
-        self.STATE_VECTOR_SIZE = state_size + req_size
-
         # 高层动作 = 选择哪个目的地 (假设最多10个目的地)
         self.NB_HIGH_LEVEL_GOALS = 10
 
@@ -86,8 +124,35 @@ class SFC_HIRL_Env(gym.Env):
         self.MAX_PATHS_IN_TREE = 10  # 假设一棵树最多有10条路径
         self.NB_LOW_LEVEL_ACTIONS = self.MAX_PATHS_IN_TREE * self.K_path
 
+        # ----------------------------------------------------
+        # 修复 #5: (补丁 5) 使用 PathManager
+        # ----------------------------------------------------
+        self.path_manager = PathManager(max_paths=self.MAX_PATHS_IN_TREE)
+
+        # ----------------------------------------------------
+        # 修复 #2: (补丁 2) 明确计算状态维度
+        # ----------------------------------------------------
+        self.dim_cpu = self.n
+        self.dim_mem = self.n
+        self.dim_bw = self.L
+        self.dim_hvt = self.n * self.K_vnf
+        self.dim_network = self.dim_cpu + self.dim_mem + self.dim_bw + self.dim_hvt
+        self.dim_request = 10  # 简化的请求特征向量
+        self.STATE_VECTOR_SIZE = self.dim_network + self.dim_request
+
+        print(f"状态维度: 网络={self.dim_network}, 请求={self.dim_request}, 总计={self.STATE_VECTOR_SIZE}")
+
+        # 定义 Gym 空间
         self.action_space = spaces.Discrete(self.NB_HIGH_LEVEL_GOALS)
         self.observation_space = spaces.Box(low=0, high=1, shape=(self.STATE_VECTOR_SIZE,), dtype=np.float32)
+
+        # ----------------------------------------------------
+        # ✅ 修复: (补丁 A) 添加你的新计数器
+        # ----------------------------------------------------
+        self.total_requests_seen = 0  # 新到达的请求数
+        self.total_requests_accepted = 0  # 完整被接受的请求数（所有dest都部署完成）
+        self.total_dest_seen = 0  # 累计到达的目的地数量（sum len(dest)）
+        self.total_dest_accepted = 0  # 累计成功部署的目的地数量（每成功部署1个 +1）
 
     def _get_network_state_dict(self) -> Dict:
         """获取专家求解器所需格式的当前网络状态"""
@@ -97,7 +162,7 @@ class SFC_HIRL_Env(gym.Env):
         }
 
     # ----------------------------------------------------
-    # ✅ 修复 #2: 替换为您的新 _get_flat_state 方法
+    # 修复 #2: 替换为您的新 _get_flat_state 方法
     # ----------------------------------------------------
     def _get_flat_state(self) -> np.ndarray:
         """
@@ -117,7 +182,7 @@ class SFC_HIRL_Env(gym.Env):
         hvt_norm = np.clip(net_state_dict['hvt'].flatten() / 10.0, 0, 1)  # (n*K,)
 
         # 3. 编码当前请求
-        req_vec = np.zeros(10)
+        req_vec = np.zeros(self.dim_request)  # 使用 self.dim_request
         if self.current_request:
             # 特征 0: 带宽需求 (归一化)
             req_vec[0] = self.current_request['bw_origin'] / self.B_cap
@@ -165,15 +230,11 @@ class SFC_HIRL_Env(gym.Env):
         final_state = np.zeros(self.STATE_VECTOR_SIZE)
 
         # 网络状态部分
-        net_state_len = len(flat_state)
-        if net_state_len <= self.STATE_VECTOR_SIZE - 10:
-            final_state[:net_state_len] = flat_state
-        else:
-            # 如果超长，截断 (优先保留CPU、Mem、BW，可能截断部分HVT)
-            final_state[:-10] = flat_state[:self.STATE_VECTOR_SIZE - 10]
+        # (使用 self.dim_network 和 self.dim_request 保证维度)
+        final_state[:self.dim_network] = flat_state[:self.dim_network]
 
         # 请求特征部分 (最后10维)
-        final_state[-10:] = req_vec
+        final_state[self.dim_network:] = req_vec
 
         return final_state.astype(np.float32)
 
@@ -216,6 +277,15 @@ class SFC_HIRL_Env(gym.Env):
         重置环境以处理一个新请求。
         返回 (请求字典, 初始高层状态)
         """
+
+        # 修复: (补丁 A) 添加你的 Debug 探针
+        print(f"DEBUG reset_request: t={self.t}, events_len={len(self.events)}")
+        if self.t < len(self.events):
+            try:
+                print("  arrive sample:", self.events[self.t]['arrive'][:10])
+            except Exception as e:
+                print("  cannot print arrive, err:", e)
+
         # 1. 推进时间，直到找到一个新请求
         self.current_request = None
         while self.current_request is None and self.t < self.T:
@@ -238,7 +308,14 @@ class SFC_HIRL_Env(gym.Env):
         if self.current_request is None:
             return None, self._get_flat_state()
 
-            # 2. 初始化 HIRL 状态
+        # ----------------------------------------------------
+        # ✅ 修复: (补丁 A) 更新计数器
+        # ----------------------------------------------------
+        if self.current_request is not None:
+            self.total_requests_seen += 1
+            self.total_dest_seen += len(self.current_request.get('dest', []))
+
+        # 2. 初始化 HIRL 状态
         self.unadded_dest_indices = set(range(len(self.current_request['dest'])))
         self.current_tree = {
             'id': self.current_request['id'],
@@ -249,10 +326,9 @@ class SFC_HIRL_Env(gym.Env):
         self.nodes_on_tree = set([self.current_request['source']])
 
         # ----------------------------------------------------
-        # ✅ 修复 #3: 重置路径管理
+        # 修复 #5: (补丁 5) 重置路径管理器
         # ----------------------------------------------------
-        self.tree_path_list = []
-        self.tree_path_to_idx = {}
+        self.path_manager.reset()
 
         return self.current_request, self._get_flat_state()
 
@@ -298,48 +374,25 @@ class SFC_HIRL_Env(gym.Env):
             return best_d if best_d != -1 else list(self.unadded_dest_indices)[0]
 
     # ----------------------------------------------------
-    # ✅ 修复 #3: 新增辅助方法
+    # 修复 #5: (补丁 5) 替换为 PathManager 版本
     # ----------------------------------------------------
-    def _add_path_to_tree(self, path: List[int]):
-        """添加路径到树的管理结构"""
-        path_tuple = tuple(path)
-        if path_tuple not in self.tree_path_to_idx:
-            idx = len(self.tree_path_list)
-            if idx < self.MAX_PATHS_IN_TREE:  # 防止列表超出动作空间
-                self.tree_path_list.append(path)
-                self.tree_path_to_idx[path_tuple] = idx
-                return idx
-        return self.tree_path_to_idx.get(path_tuple, 0)  # 返回现有索引
 
-    # ----------------------------------------------------
-    # ✅ 修复 #3: 替换 _get_path_for_i_idx
-    # ----------------------------------------------------
     def _get_path_for_i_idx(self, i_idx: int) -> List[int]:
-        """✅ 修复: 根据 i_idx 获取树上的特定连接路径"""
+        """修复: 根据 i_idx 获取树上的特定连接路径"""
         if not self.current_tree['paths_map']:
             # 对于 S->d 阶段, i_idx 总是0，返回源节点
             return [self.current_request['source']]
 
-        # ✅ 使用稳定的路径列表
-        if not self.tree_path_list:
-            # 如果还没初始化，从 paths_map 构建
-            self.tree_path_list = list(self.current_tree['paths_map'].values())
-            self.tree_path_to_idx = {
-                tuple(path): idx for idx, path in enumerate(self.tree_path_list)
-            }
+        path = self.path_manager.get_path(i_idx)
+        if path is None:
+            # 兜底: 尝试从 paths_map 获取或返回源节点
+            if self.path_manager.paths:
+                return self.path_manager.get_path(0)
+            return [self.current_request['source']]
+        return path
 
-        # 安全地获取路径
-        if i_idx < len(self.tree_path_list):
-            return self.tree_path_list[i_idx]
-        else:
-            # 如果索引超出范围，返回第一条路径（兜底）
-            return self.tree_path_list[0] if self.tree_path_list else [self.current_request['source']]
-
-    # ----------------------------------------------------
-    # ✅ 修复 #3: 替换 get_valid_low_level_actions
-    # ----------------------------------------------------
     def get_valid_low_level_actions(self) -> List[int]:
-        """✅ 修复: 返回当前状态下有效的低层动作ID列表"""
+        """修复: 返回当前状态下有效的低层动作ID列表"""
         valid_actions = []
 
         if not self.current_tree['paths_map']:
@@ -348,7 +401,10 @@ class SFC_HIRL_Env(gym.Env):
                 valid_actions.append(0 * self.K_path + k)
         else:
             # Tree->d 阶段: 遍历所有树上的路径
-            num_paths = len(self.tree_path_list) if self.tree_path_list else len(self.current_tree['paths_map'])
+            num_paths = len(self.path_manager)
+            if num_paths == 0:
+                # 兜底，如果 path_manager 为空但 paths_map 不为空
+                num_paths = len(self.current_tree['paths_map'])
 
             for i in range(num_paths):
                 for k in range(self.K_path):
@@ -358,17 +414,18 @@ class SFC_HIRL_Env(gym.Env):
                         valid_actions.append(action_id)
 
         # 确保总有至少一个动作可选
-        if not valid_actions:
-            return [0]
-
-        return valid_actions
+        valid = valid_actions if valid_actions else [0]
+        # 修复: (补丁 B) 添加你的 Debug 探针
+        print(f"DEBUG get_valid_low_level_actions -> count={len(valid)} sample={valid[:10]}")
+        return valid
 
     def _decode_low_level_action(self, action: int) -> Tuple[int, int]:
         """将扁平化的低层动作ID (0-N) 解码为 (i_idx, k_idx)"""
         k_idx = action % self.K_path
         i_idx = action // self.K_path
+
         # 限制 i_idx 在当前树的路径数内 (或最大动作空间)
-        num_paths = max(1, len(self.tree_path_list))
+        num_paths = max(1, len(self.path_manager))
         i_idx = i_idx % min(num_paths, self.MAX_PATHS_IN_TREE)
         return i_idx, k_idx
 
@@ -390,6 +447,7 @@ class SFC_HIRL_Env(gym.Env):
         plan = None
         cost = 0.0
         feasible = False
+        eval_val = "NA"  # (用于 Debug 探针)
 
         if not self.current_tree['paths_map']:
             # 阶段1: 尝试 S -> d (i_idx 必须为 0)
@@ -407,28 +465,55 @@ class SFC_HIRL_Env(gym.Env):
             if plan['feasible']:
                 feasible = True
 
+        # 修复: (补丁 C) 添加你的 Debug 探针
+        print(
+            f"DEBUG step_low_level try: goal={goal_dest_idx}, i_idx={i_idx}, k={k}, feasible_guess={feasible}, eval_val={eval_val}")
+
         if feasible:
+            # 修复: (补丁 D) 添加你的 Debug 探针
+            print("  APPLIED deployment. unadded before removal:", self.unadded_dest_indices)
+
             # 成功！应用资源
             self._apply_deployment(self.current_request, plan)
             self.unadded_dest_indices.remove(goal_dest_idx)
             dest_node = self.current_request['dest'][goal_dest_idx]
 
             # ----------------------------------------------------
-            # ✅ 修复 #3: 更新路径管理
+            # ✅ 修复: (补丁 B) 更新子目的地计数
+            # ----------------------------------------------------
+            self.total_dest_accepted += 1
+            print(f"METRIC: total_dest_seen={self.total_dest_seen}, total_dest_accepted={self.total_dest_accepted}")
+
+            # ----------------------------------------------------
+            # 修复 #5: (补丁 5) 更新路径管理器
             # ----------------------------------------------------
             new_path = plan['new_path_full']
-            self._add_path_to_tree(new_path)  # 添加到稳定列表
+            self.path_manager.add_path(new_path)  # 添加到稳定列表
             self.current_tree['paths_map'][dest_node] = new_path
             self.nodes_on_tree.update(new_path)
+
+            # 修复: (补丁 D) 添加你的 Debug 探针
+            print("  unadded after:", self.unadded_dest_indices, "served_requests_len:", len(self.served_requests))
 
             sub_task_done = True
             if not self.unadded_dest_indices:
                 # 整个请求完成了
-                self.served_requests.append((self.current_request, self.current_tree))
+                if (self.current_request, self.current_tree) not in self.served_requests:
+                    self.served_requests.append((self.current_request, self.current_tree))
+
+                # ----------------------------------------------------
+                # ✅ 修复: (补丁 B) 更新完整请求计数
+                # ----------------------------------------------------
+                self.total_requests_accepted += 1
+                print(
+                    f"METRIC: Request {self.current_request['id']} COMPLETED. total_requests_accepted={self.total_requests_accepted}")
         else:
             # 失败！
             cost = 10.0  # 惩罚
-            sub_task_done = True  # 强制结束这个子任务
+            sub_task_done = False  # 修复: 任务未完成, Agent 必须重试
+
+            # 修复: (补丁 C) 添加你的 Debug 探针
+            print(f"  plan infeasible for goal {goal_dest_idx}")
 
         request_done = not self.unadded_dest_indices
         return self._get_flat_state(), cost, sub_task_done, request_done
