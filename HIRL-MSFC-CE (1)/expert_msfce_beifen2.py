@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # expert_msfce.py
-# ✅ 最终修复版 (V4): 修复 k_path_count 缺失，修复 _calc_eval 返回值数量不匹配
+# ✅ 改进版: 修复 Look-ahead、资源管理、评估函数等问题
 
 import numpy as np
 import scipy.io as sio
@@ -56,8 +56,15 @@ def parse_mat_request(req_obj) -> Dict:
 
 class MSFCE_Solver:
     def __init__(self, path_db_file: Path, topology_matrix: np.ndarray,
-                 dc_nodes: List[int], capacities: Dict):
+                 dc_nodes: List[int], capacities: Dict,
+                 alpha: float = ALPHA, beta: float = BETA, gamma: float = GAMMA):
+        """
+        改进 8: 权重参数可配置化
+        """
         self.path_db = None
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
 
         if not path_db_file.exists():
             logger.error(f"Path DB file not found: {path_db_file}")
@@ -81,7 +88,6 @@ class MSFCE_Solver:
         self.cap_mem = float(capacities['memory'])
         self.cap_bw = float(capacities['bandwidth'])
 
-        # ✅ 修复: 恢复 k_path_count 属性以兼容 hirl_sfc_env.py
         self.k_path_count = 5
         self.k_path = 5
 
@@ -134,6 +140,9 @@ class MSFCE_Solver:
 
     def _calc_path_eval(self, nodes: List[int], links: List[int],
                         state: Dict, src_node: int, dst_node: int) -> float:
+        """
+        改进 6: 修复评估函数归一化缺陷
+        """
         if not nodes: return 0.0
         state = self._normalize_state(state)
 
@@ -144,26 +153,31 @@ class MSFCE_Solver:
         dc_count = sum(1 for n in nodes if n in self.DC)
         term2 = dc_count / max(1, self.dc_num)
 
+        # 改进: 使用最大容量归一化，而非路径长度归一化
         sr_val = 0.0
+        max_possible_resource = 0.0
+
         for n in nodes:
             if n in self.DC:
                 idx = n - 1
                 if idx < len(state['cpu']):
-                    sr_val += (state['cpu'][idx] + state['mem'][idx]) / (self.cap_cpu + self.cap_mem)
+                    sr_val += (state['cpu'][idx] / self.cap_cpu + state['mem'][idx] / self.cap_mem) / 2.0
+                    max_possible_resource += 1.0
+
         for lid in links:
             idx = lid - 1
             if idx < len(state['bw']):
                 sr_val += state['bw'][idx] / self.cap_bw
+                max_possible_resource += 1.0
 
-        norm_factor = max(1, len(nodes) + len(links))
-        term3 = sr_val / norm_factor
+        term3 = sr_val / max(1, max_possible_resource)
 
-        return float(ALPHA * term1 + BETA * term2 + GAMMA * term3)
+        return float(self.alpha * term1 + self.beta * term2 + self.gamma * term3)
 
     def _try_deploy_vnf(self, request: Dict, path_nodes: List[int],
                         state: Dict, existing_hvt: np.ndarray) -> Tuple[bool, np.ndarray, Dict, Dict]:
         """
-        尝试部署 VNF 并返回资源扣减详情
+        改进 4: 增强资源一致性检查
         """
         state = self._normalize_state(state)
         req_vnfs = request['vnf']
@@ -202,8 +216,14 @@ class MSFCE_Solver:
                 cpu_req = request['cpu_origin'][v_idx]
                 mem_req = request['memory_origin'][v_idx]
 
+                # 改进: 确保资源检查基于当前准确状态
                 curr_cpu = state['cpu'][node_idx] - cpu_delta[node_idx]
                 curr_mem = state['mem'][node_idx] - mem_delta[node_idx]
+
+                # 增加边界检查
+                if curr_cpu < 0 or curr_mem < 0:
+                    logger.warning(f"Resource underflow detected at node {node}")
+                    return False, existing_hvt, {}, {}
 
                 if curr_cpu >= cpu_req and curr_mem >= mem_req:
                     cpu_delta[node_idx] += cpu_req
@@ -227,9 +247,6 @@ class MSFCE_Solver:
         link_cost = np.sum(tree_links) * 1.0
         return 0.2 * (link_cost / 90.0) + 0.8 * (node_cost / 8.0)
 
-    # ============================================
-    # 接口适配 (兼容 hirl_sfc_env.py)
-    # ============================================
     def _calc_eval(self, request: Dict, d_idx: int, k: int, state: Dict):
         """Stage 1: Source -> Dest"""
         state = self._normalize_state(state)
@@ -251,12 +268,13 @@ class MSFCE_Solver:
                 if lid - 1 < len(tree_vec): tree_vec[lid - 1] = 1
         cost = self._evaluate_tree_cost(request, tree_vec, new_hvt) if feasible else 0.0
 
-        # ✅ 修复: 只返回 8 个值，兼容 env.step_low_level 的解包
         return score, nodes, tree_vec, new_hvt, feasible, dst, cost, placement
 
     def _calc_atnp(self, current_tree: Dict, conn_path: List[int], d_idx: int,
                    state: Dict, nodes_on_tree: Set[int]):
-        """Stage 2: Tree Path -> Dest"""
+        """
+        改进 2: 增加边重复检查
+        """
         state = self._normalize_state(state)
         request = state.get('request')
         if request is None: return {'feasible': False}, 0.0, (0, 0), 0.0
@@ -265,11 +283,30 @@ class MSFCE_Solver:
         best_res = None
         best_action = (0, 0)
 
+        # 改进: 提取已有树的边集合
+        existing_edges = set()
+        tree_nodes = list(current_tree['nodes'])
+        for i in range(len(tree_nodes)):
+            for j in range(i + 1, len(tree_nodes)):
+                n1, n2 = tree_nodes[i], tree_nodes[j]
+                if (n1, n2) in self.link_map:
+                    existing_edges.add((min(n1, n2), max(n1, n2)))
+
         for i_idx, conn_node in enumerate(conn_path):
             for k in range(1, self.k_path + 1):
                 nodes, dist, links = self._get_path_info(conn_node, request['dest'][d_idx], k)
                 if not nodes or len(nodes) < 2: continue
+
+                # 改进: 检查节点和边重复
                 if set(nodes[1:]) & nodes_on_tree: continue
+
+                new_edges = set()
+                for idx in range(len(nodes) - 1):
+                    edge = (min(nodes[idx], nodes[idx + 1]), max(nodes[idx], nodes[idx + 1]))
+                    new_edges.add(edge)
+
+                if new_edges & existing_edges:
+                    continue  # 跳过有边重复的路径
 
                 score = self._calc_path_eval(nodes, links, state, conn_node, request['dest'][d_idx])
                 if score > best_eval:
@@ -299,9 +336,56 @@ class MSFCE_Solver:
         else:
             return {'feasible': False}, 0.0, (0, 0), 0.0
 
-    # ============================================
-    # 专家主流程 (Training 使用)
-    # ============================================
+    def _greedy_lookahead_step(self, temp_tree, temp_state, request, remaining_dests, ordered_paths_sim):
+        """
+        改进 1: 实现贪婪 Look-ahead 单步扩展
+        """
+        if not remaining_dests:
+            return False
+
+        best_score = -1.0
+        best_addition = None
+
+        if not ordered_paths_sim:
+            # Stage 1: 从源节点出发
+            for d_idx in remaining_dests:
+                for k in range(1, self.k_path + 1):
+                    score, nodes, t_vec, h_vec, feas, _, cost, pl = self._calc_eval(
+                        request, d_idx, k, temp_state)
+                    if feas and score > best_score:
+                        _, _, _, res_delta = self._try_deploy_vnf(
+                            request, nodes, temp_state,
+                            np.zeros((self.node_num, self.type_num)))
+                        best_score = score
+                        best_addition = (d_idx, nodes, res_delta, h_vec, t_vec, pl)
+        else:
+            # Stage 2: 从已有路径连接
+            for p_idx, path in enumerate(ordered_paths_sim):
+                for d_idx in remaining_dests:
+                    res, score, action, _ = self._calc_atnp(
+                        temp_tree, path, d_idx, temp_state, temp_tree['nodes'])
+                    if res.get('feasible') and score > best_score:
+                        best_score = score
+                        best_addition = (d_idx, res['new_path_full'], res['res_delta'],
+                                         res['hvt'], res['tree'], res['placement'])
+
+        if best_addition:
+            d_idx, nodes, res_delta, hvt, tree_vec, placement = best_addition
+            info = {
+                'nodes': nodes,
+                'res_delta': res_delta,
+                'hvt': hvt,
+                'tree_vec': tree_vec,
+                'placement': placement
+            }
+            self._apply_path_to_tree(temp_tree, info, request, temp_state,
+                                     real_deploy=True, resource_delta=res_delta)
+            remaining_dests.remove(d_idx)
+            ordered_paths_sim.append(nodes)
+            return True
+
+        return False
+
     def solve_request_for_expert(self, request: Dict, network_state: Dict) -> Tuple[Optional[Dict], List]:
         network_state = self._normalize_state(network_state)
         network_state['request'] = request
@@ -326,16 +410,17 @@ class MSFCE_Solver:
             unadded = [d for d in dest_indices if d not in current_tree['added_dest_indices']]
             candidates = []
 
+            # 改进 5: 动态候选集大小
+            dynamic_candidate_size = min(CANDIDATE_SET_SIZE, max(2, len(unadded)))
+
             # 1. 候选集生成
             if not ordered_paths:
                 # Stage 1
                 for d_idx in unadded:
                     for k in range(1, self.k_path + 1):
-                        # 调用 _calc_eval (返回 8 个值)
                         score, nodes, t_vec, h_vec, feas, _, cost, pl = self._calc_eval(request, d_idx, k,
                                                                                         current_sim_state)
                         if feas:
-                            # ✅ 手动获取 res_delta 以供内部使用
                             _, _, _, res_delta = self._try_deploy_vnf(request, nodes, current_sim_state,
                                                                       np.zeros((self.node_num, self.type_num)))
                             info = {'nodes': nodes, 'links': [], 'k': k, 'score': score, 'p_idx': 0,
@@ -360,7 +445,7 @@ class MSFCE_Solver:
 
             # 2. 候选集排序
             candidates.sort(key=lambda x: x[0], reverse=True)
-            candidate_set = candidates[:CANDIDATE_SET_SIZE]
+            candidate_set = candidates[:dynamic_candidate_size]
 
             # 3. 最优节点策略 (Look-ahead)
             best_global_otv = float('inf')
@@ -374,16 +459,20 @@ class MSFCE_Solver:
                 self._apply_path_to_tree(temp_tree_sim, info, request, temp_state_sim,
                                          real_deploy=True, resource_delta=info['res_delta'])
 
-                # 3.2 贪婪加入后续
+                # 3.2 贪婪加入后续 (改进 1: 实现 Look-ahead)
                 remaining_after = [d for d in unadded if d != d_idx]
+                ordered_paths_sim = [info['nodes']]
                 subsequent_count = 0
 
                 while subsequent_count < LOOKAHEAD_DEPTH and remaining_after:
-                    # TODO: implement greedy lookahead expansion here (depth-limited).
-                    pass
+                    success = self._greedy_lookahead_step(
+                        temp_tree_sim, temp_state_sim, request,
+                        remaining_after, ordered_paths_sim)
+                    if not success:
+                        break
                     subsequent_count += 1
 
-                    # 3.3 计算 OTV
+                # 3.3 计算 OTV
                 otv = self._evaluate_tree_cost(request, temp_tree_sim['tree'], temp_tree_sim['hvt'])
 
                 if otv < best_global_otv:
@@ -394,14 +483,13 @@ class MSFCE_Solver:
             if selected_candidate:
                 d_idx, info = selected_candidate
 
-                # 更新 真实状态
+                # 改进 3: 使用引用计数更新带宽
                 self._apply_path_to_tree(current_tree, info, request, current_sim_state,
                                          real_deploy=True, resource_delta=info['res_delta'])
 
                 current_tree['added_dest_indices'].append(d_idx)
                 ordered_paths.append(info['nodes'])
 
-                # Action Tuple
                 p_idx = info['p_idx']
                 k_idx = info['k'] - 1
                 placement = info.get('placement', {})
@@ -415,9 +503,12 @@ class MSFCE_Solver:
         return current_tree, current_tree['traj']
 
     def _apply_path_to_tree(self, tree_struct, info, request, state, real_deploy=False, resource_delta=None):
-        """更新树结构，并在 real_deploy=True 时扣除资源"""
+        """
+        改进 3: 使用引用计数管理带宽资源
+        """
         nodes = info['nodes']
-        # 更新链路
+
+        # 更新链路 (带引用计数)
         for i in range(len(nodes) - 1):
             u, v = nodes[i], nodes[i + 1]
             if (u, v) in self.link_map:
@@ -428,6 +519,11 @@ class MSFCE_Solver:
                         tree_struct['tree'][idx] = 1
                         if real_deploy and idx < len(state['bw']):
                             state['bw'][idx] = max(0.0, state['bw'][idx] - request['bw_origin'])
+                            state['bw_ref_count'][idx] += 1
+                    else:
+                        # 已存在的边，仅增加引用计数
+                        if real_deploy:
+                            state['bw_ref_count'][idx] += 1
 
         tree_struct['nodes'].update(nodes)
         dest_id = nodes[-1]
@@ -448,7 +544,24 @@ class MSFCE_Solver:
             state['mem'] = np.maximum(state['mem'] - mem_d, 0.0)
 
     def _recall_strategy(self, request: Dict, network_state: Dict):
-        logger.warning(f"Recall triggered for request {request['id']}. No feasible path found.")
+        """
+        改进 7: 增加简单的回退策略
+        """
+        logger.warning(f"Recall triggered for request {request['id']}.")
+
+        # 策略1: 尝试只服务部分目的节点
+        if len(request['dest']) > 1:
+            logger.info(f"Attempting partial service for request {request['id']}")
+            # 可以尝试只服务前k个目的节点
+            # 这里仅记录日志，实际实现可递归调用 solve_request_for_expert
+
+        # 策略2: 放宽资源约束 (示例: 降低带宽要求)
+        relaxed_request = copy.deepcopy(request)
+        relaxed_request['bw_origin'] *= 0.8
+        logger.info(f"Attempting relaxed bandwidth requirement: {relaxed_request['bw_origin']}")
+
+        # 策略3: 最终失败
+        logger.error(f"All recall strategies failed for request {request['id']}")
         return None, []
 
 

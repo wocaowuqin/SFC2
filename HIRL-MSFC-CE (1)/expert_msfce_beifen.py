@@ -1,76 +1,84 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# @File    : expert_msfce.py
+# expert_msfce.py
+# ✅ 完全修复版本: 解决所有 KeyError 问题
 
 import numpy as np
 import scipy.io as sio
 from pathlib import Path
-from typing import Dict, List, Tuple, Set, Optional, Any
+from typing import Dict, List, Tuple, Optional, Set, Any
+import copy
+
+# --- 配置参数 ---
+ALPHA = 0.3  # 跳数权重
+BETA = 0.3  # DC节点数权重
+GAMMA = 0.4  # 剩余资源权重
+CANDIDATE_SET_SIZE = 4  # 候选集合大小
 
 
 def parse_mat_request(req_obj) -> Dict:
-    """
-    将 MATLAB 请求结构 (来自 sorted_requests.mat) 解析为 Python 字典
-    (代码来自: msfce_simulator_fixed.py)
-    """
-    req = req_obj
+    """解析 MATLAB 请求结构"""
     try:
         parsed = {
-            'id': int(req['id'][0, 0]),
-            'source': int(req['source'][0, 0]),
-            'dest': [int(d) for d in req['dest'].flatten()],
-            'vnf': [int(v) for v in req['vnf'].flatten()],
-            'bw_origin': float(req['bw_origin'][0, 0]),
-            'cpu_origin': [float(c) for c in req['cpu_origin'].flatten()],
-            'memory_origin': [float(m) for m in req['memory_origin'].flatten()],
-            'arrival_time': int(req['arrival_time'][0, 0]),
-            'leave_time': int(req['leave_time'][0, 0]),
+            'id': int(req_obj['id'][0, 0]),
+            'source': int(req_obj['source'][0, 0]),
+            'dest': [int(d) for d in req_obj['dest'].flatten()],
+            'vnf': [int(v) for v in req_obj['vnf'].flatten()],
+            'bw_origin': float(req_obj['bw_origin'][0, 0]),
+            'cpu_origin': [float(c) for c in req_obj['cpu_origin'].flatten()],
+            'memory_origin': [float(m) for m in req_obj['memory_origin'].flatten()],
+            'arrival_time': int(req_obj['arrival_time'][0, 0]),
+            'leave_time': int(req_obj['leave_time'][0, 0]),
         }
-    except (IndexError, TypeError):
+    except Exception:
         parsed = {
-            'id': int(req[0][0][0]),
-            'source': int(req[0][1][0]),
-            'dest': [int(x) for x in req[0][2].flatten()],
-            'vnf': [int(x) for x in req[0][3].flatten()],
-            'cpu_origin': [float(x) for x in req[0][4].flatten()],
-            'memory_origin': [float(x) for x in req[0][5].flatten()],
-            'bw_origin': float(req[0][6][0][0])
+            'id': int(req_obj[0][0][0]),
+            'source': int(req_obj[0][1][0]),
+            'dest': [int(x) for x in req_obj[0][2].flatten()],
+            'vnf': [int(x) for x in req_obj[0][3].flatten()],
+            'cpu_origin': [float(x) for x in req_obj[0][4].flatten()],
+            'memory_origin': [float(x) for x in req_obj[0][5].flatten()],
+            'bw_origin': float(req_obj[0][6][0][0])
         }
     return parsed
 
 
 class MSFCE_Solver:
-    """
-    MSFC-CE 启发式算法求解器 (无状态)
-    (代码来自: msfce_simulator_fixed.py)
-    这是我们的“专家预言机”，用于生成模仿学习的标签。
-    """
-
     def __init__(self, path_db_file: Path, topology_matrix: np.ndarray,
                  dc_nodes: List[int], capacities: Dict):
-        print("初始化 MSFC-CE 专家求解器...")
+        self.path_db = None
         try:
-            self.path_db = sio.loadmat(path_db_file)['Paths']
-        except FileNotFoundError:
-            print(f"致命错误: 找不到 MAT 文件 {path_db_file}")
-            raise
-        except KeyError:
-            print(f"致命错误: MAT 文件 {path_db_file} 中缺少 'Paths' 键")
-            raise
+            if path_db_file.exists():
+                self.path_db = sio.loadmat(path_db_file)['Paths']
+                print(f"✅ 成功加载路径数据库: {path_db_file}")
+        except Exception as e:
+            print(f"⚠️ 无法加载路径数据库: {e}")
 
         self.node_num = topology_matrix.shape[0]
+        self.link_num, self.link_map = self._create_link_map(topology_matrix)
+
         self.type_num = 8
-        self.k_path_count = 5
         self.DC = set(dc_nodes)
         self.dc_num = len(dc_nodes)
-        self.cpu_capacity = capacities['cpu']
-        self.memory_capacity = capacities['memory']
-        self.bandwidth_capacity = capacities['bandwidth']
-        self.link_num, self.link_map = self._create_link_map(topology_matrix)
-        print(f"专家加载: {self.node_num}节点, {self.link_num}链路, {self.dc_num}DC")
+
+        # ✅ 修复: 统一容量属性命名
+        self.cap_cpu = float(capacities['cpu'])
+        self.cap_mem = float(capacities['memory'])
+        self.cap_bw = float(capacities['bandwidth'])
+
+        # 保留旧名称以兼容
+        self.cpu_capacity = self.cap_cpu
+        self.memory_capacity = self.cap_mem
+        self.bandwidth_capacity = self.cap_bw
+
+        self.k_path_count = 5
+        self.k_path = 5
+
+        print(f"✅ 专家初始化: {self.node_num}节点, {self.link_num}链路, {self.dc_num}DC")
 
     def _create_link_map(self, topo: np.ndarray) -> Tuple[int, Dict]:
-        link_map, lid = {}, 1
+        link_map = {}
+        lid = 1
         for i in range(topo.shape[0]):
             for j in range(i + 1, topo.shape[0]):
                 if not np.isinf(topo[i, j]) and topo[i, j] > 0:
@@ -79,406 +87,422 @@ class MSFCE_Solver:
                     lid += 1
         return lid - 1, link_map
 
-    def _get_path_from_db(self, src: int, dst: int, k: int):
-        if src < 1 or dst < 1 or src > self.node_num or dst > self.node_num:
+    def _get_path_info(self, src: int, dst: int, k: int):
+        """获取第k条最短路径"""
+        if self.path_db is None:
             return [], 0, []
         try:
-            p = self.path_db[src - 1, dst - 1]
-            dist = int(p['pathsdistance'][k - 1][0])
-            nodes = p['paths'][k - 1, :dist + 1].astype(int).tolist()
-            links = [self.link_map[(nodes[i], nodes[i + 1])]
-                     for i in range(len(nodes) - 1)
-                     if (nodes[i], nodes[i + 1]) in self.link_map]
+            cell = self.path_db[src - 1, dst - 1]
+            dist = int(cell['pathsdistance'][k - 1][0])
+            nodes = cell['paths'][k - 1, :dist + 1].astype(int).tolist()
+            links = []
+            for i in range(len(nodes) - 1):
+                u, v = nodes[i], nodes[i + 1]
+                if (u, v) in self.link_map:
+                    links.append(self.link_map[(u, v)])
             return nodes, dist, links
         except Exception:
             return [], 0, []
 
-    def _get_kth_path_max_distance(self, src: int, dst: int, kpath: int) -> int:
+    def _get_max_hops(self, src: int, dst: int) -> int:
+        """获取最大跳数"""
         try:
-            return int(self.path_db[src - 1, dst - 1]['pathsdistance'][kpath - 1][0])
-        except Exception:
-            return 1
+            cell = self.path_db[src - 1, dst - 1]
+            return int(cell['pathsdistance'][self.k_path - 1][0])
+        except:
+            return 10
 
-    def _calc_score(self, src: int, dst: int, dist: int, dc_count: int,
-                    cpu_sum: float, mem_sum: float, bw_sum: float) -> float:
-        """计算评分函数"""
-        max_dist = self._get_kth_path_max_distance(src, dst, self.k_path_count) or 1
-        score = (
-                (1 - dist / max_dist) +
-                dc_count / self.dc_num +
-                cpu_sum / (self.cpu_capacity * self.dc_num) +
-                mem_sum / (self.memory_capacity * self.dc_num) +
-                bw_sum / (self.bandwidth_capacity * self.link_num)
-        )
-        return score
+    # ============================================
+    # ✅ 关键修复: 标准化状态访问方法
+    # ============================================
+    def _normalize_state(self, state: Dict) -> Dict:
+        """
+        将环境状态转换为专家内部格式
+        环境使用: 'bw', 'cpu', 'mem', 'hvt', 'bw_ref_count'
+        """
+        normalized = {}
 
-    def _calc_eval(self, request: Dict, d_idx: int, k: int, state: Dict):
-        """评估 S->d 的第k条路径"""
-        bw, cpu, mem, hvt = state['bw'], state['cpu'], state['mem'], state['hvt']
-        src, dest = request['source'], request['dest'][d_idx]
+        # 带宽
+        normalized['bw'] = state.get('bw', state.get('bandwidth', np.full(self.link_num, self.cap_bw)))
 
-        path, dist, links = self._get_path_from_db(src, dest, k)
-        if not path:
-            return 0, [], np.zeros(self.link_num), np.zeros((self.node_num, self.type_num)), False, dest, 0
+        # CPU
+        normalized['cpu'] = state.get('cpu', np.full(self.node_num, self.cap_cpu))
 
-        tree = np.zeros(self.link_num)
-        hvt_new = np.zeros((self.node_num, self.type_num))
-        usable = [n for n in path if n in self.DC]
+        # 内存
+        normalized['mem'] = state.get('mem', state.get('memory', np.full(self.node_num, self.cap_mem)))
 
-        # 检查资源
-        if len(usable) < len(request['vnf']):
-            # ✅ 修复: 添加你的 Debug 探针
-            print(
-                f"DEBUG_EVAL FAIL (goal={dest}): Not enough DC nodes on path. Found {len(usable)}, Need {len(request['vnf'])}")
-            return 0, path, tree, hvt_new, False, dest, 0
-        for lid in links:
-            if lid - 1 >= len(bw) or bw[lid - 1] < request['bw_origin']:
-                # ✅ 修复: 添加你的 Debug 探针
-                print(f"DEBUG_EVAL FAIL (goal={dest}): link {lid} bw={bw[lid - 1]} < req_bw={request['bw_origin']}")
-                return 0, path, tree, hvt_new, False, dest, 0
+        # HVT (最关键!)
+        normalized['hvt'] = state.get('hvt', state.get('hvt_all', np.zeros((self.node_num, self.type_num))))
 
-        # VNF 放置
-        j, i = 0, 0
-        while j < len(request['vnf']):
-            if i >= len(usable):
-                print(f"DEBUG_EVAL FAIL (goal={dest}): Ran out of usable DC nodes while placing VNF {j}")
-                return 0, path, tree, hvt_new, False, dest, 0
-            node, vnf_t = usable[i] - 1, request['vnf'][j] - 1
-            if hvt[node, vnf_t] == 0:
-                if cpu[node] < request['cpu_origin'][j] or mem[node] < request['memory_origin'][j]:
-                    # ✅ 修复: 添加你的 Debug 探针
-                    print(
-                        f"DEBUG_EVAL FAIL (goal={dest}): node {node + 1} cpu/mem not enough. Has C={cpu[node]}, M={mem[node]}. Need C={request['cpu_origin'][j]}, M={request['memory_origin'][j]}")
-                    i += 1
-                    continue
-            hvt_new[node, vnf_t] = 1
-            j, i = j + 1, i + 1
+        # 引用计数
+        normalized['bw_ref_count'] = state.get('bw_ref_count', np.zeros(self.link_num))
 
-        if np.sum(hvt_new) != len(request['vnf']):
-            print(f"DEBUG_EVAL FAIL (goal={dest}): VNF placement count mismatch.")
-            return 0, path, tree, hvt_new, False, dest, 0
+        # 请求
+        if 'request' in state:
+            normalized['request'] = state['request']
 
-        for lid in links:
-            tree[lid - 1] = 1
+        return normalized
 
-        # 计算成本
-        cost = self._calculate_cost(request, state, tree, hvt_new)
-
-        # 计算得分
-        score = self._calc_score(src, dest, dist, len(usable),
-                                 np.sum(cpu[np.array(path) - 1]),
-                                 np.sum(mem[np.array(path) - 1]),
-                                 np.sum(bw[np.array(links) - 1]))
-
-        return score, path, tree, hvt_new, True, dest, cost
-
-    def _calc_eval1(self, d_idx: int, k: int, i_idx: int, tree1_path: List[int],
-                    request: Dict, tree1_hvt: np.ndarray, state: Dict, nodes_on_tree: Set[int]):
-        """评估从树上第 i_idx 个节点到目的节点 d_idx 的第 k 条路径"""
-        hvt = tree1_hvt.copy()
-        tree = np.zeros(self.link_num)
-        tree_paths = tree1_path[:i_idx + 1]
-
-        connect_node = tree1_path[i_idx]
-        dest_node = request['dest'][d_idx]
-
-        paths, dist, links = self._get_path_from_db(connect_node, dest_node, k)
-
-        if not paths or len(paths) < 2:
-            return 0, [], tree, hvt, False, dest_node, 0
-
-        # 检测环路
-        arr1 = set(paths[1:])
-        arr2 = set(tree_paths)
-        if arr1 & arr2:
-            print(f"DEBUG_EVAL1 FAIL (goal={dest_node}): Loop detected (arr1 & arr2)")
-            return 0, paths, tree, hvt, False, dest_node, 0
-        arr4 = nodes_on_tree - set(tree_paths)
-        if arr1 & arr4:
-            print(f"DEBUG_EVAL1 FAIL (goal={dest_node}): Loop detected (arr1 & arr4)")
-            return 0, paths, tree, hvt, False, dest_node, 0
-        if i_idx + 1 < len(tree1_path):
-            arr6 = set(tree1_path[i_idx + 1:])
-            if arr1 & arr6:
-                print(f"DEBUG_EVAL1 FAIL (goal={dest_node}): Loop detected (arr1 & arr6)")
-                return 0, paths, tree, hvt, False, dest_node, 0
-
-        usable_on_path = [n for n in paths[1:] if n in self.DC]
-        deployed_on_path = [n for n in tree_paths if n in self.DC]
-
-        for lid in links:
-            if lid - 1 >= len(state['bw']) or state['bw'][lid - 1] < request['bw_origin']:
-                # ✅ 修复: 添加你的 Debug 探针
-                print(
-                    f"DEBUG_EVAL1 FAIL (goal={dest_node}): link {lid} bw={state['bw'][lid - 1]} < req_bw={request['bw_origin']}")
-                return 0, paths, tree, hvt, False, dest_node, 0
-
-        CPU_status = sum(state['cpu'][n - 1] for n in paths[1:] if n in self.DC)
-        Memory_status = sum(state['mem'][n - 1] for n in paths[1:] if n in self.DC)
-        Bandwidth_status = sum(state['bw'][lid - 1] for lid in links)
-
-        shared_path_deployed = sum(
-            1 for vnf_type in request['vnf']
-            if any(hvt[n - 1, vnf_type - 1] > 0 for n in deployed_on_path)
-        )
-        undeployed_vnf = len(request['vnf']) - shared_path_deployed
-
-        if undeployed_vnf == 0:
-            eval_score = self._calc_score(
-                connect_node, dest_node, dist,
-                len(deployed_on_path), CPU_status, Memory_status, Bandwidth_status
-            )
-            for lid in links:
-                tree[lid - 1] = 1
-            cost = self._calculate_cost(request, state, tree, hvt)
-            return eval_score, paths, tree, hvt, True, 0, cost
-        else:
-            if len(usable_on_path) < undeployed_vnf:
-                print(
-                    f"DEBUG_EVAL1 FAIL (goal={dest_node}): Not enough DC nodes on branch. Found {len(usable_on_path)}, Need {undeployed_vnf}")
-                return 0, paths, tree, hvt, False, dest_node, 0
-
-            j, g = shared_path_deployed, 0
-            while j < len(request['vnf']) and g < len(usable_on_path):
-                node_idx = usable_on_path[g] - 1
-                vnf_type = request['vnf'][j] - 1
-                if hvt[node_idx, vnf_type] == 0:
-                    if (state['cpu'][node_idx] < request['cpu_origin'][j] or
-                            state['mem'][node_idx] < request['memory_origin'][j]):
-                        # ✅ 修复: 添加你的 Debug 探针
-                        print(
-                            f"DEBUG_EVAL1 FAIL (goal={dest_node}): node {node_idx + 1} cpu/mem not enough. Has C={state['cpu'][node_idx]}, M={state['mem'][node_idx]}. Need C={request['cpu_origin'][j]}, M={request['memory_origin'][j]}")
-                        g += 1
-                        continue
-                hvt[node_idx, vnf_type] = 1
-                j += 1
-                g += 1
-
-            total_deployed = sum(
-                1 for vnf_type in request['vnf']
-                if any(hvt[n - 1, vnf_type - 1] > 0 for n in (deployed_on_path + usable_on_path))
-            )
-            if total_deployed != len(request['vnf']):
-                print(
-                    f"DEBUG_EVAL1 FAIL (goal={dest_node}): VNF placement count mismatch. Deployed {total_deployed}, Need {len(request['vnf'])}")
-                return 0, paths, tree, hvt, False, dest_node, 0
-
-            eval_score = self._calc_score(
-                connect_node, dest_node, dist,
-                len(usable_on_path), CPU_status, Memory_status, Bandwidth_status
-            )
-            for lid in links:
-                tree[lid - 1] = 1
-            cost = self._calculate_cost(request, state, tree, hvt)
-            return eval_score, paths, tree, hvt, True, 0, cost
-
-    # ----------------------------------------------------
-    # 修复 #1: 替换为您的新 _calculate_cost 方法
-    # ----------------------------------------------------
-    def _calculate_cost(self, request: Dict, state: Dict, tree: np.ndarray, hvt: np.ndarray) -> float:
-        """计算部署此方案的资源成本 (用于RL奖励)"""
-        bw_cost, cpu_cost, mem_cost = 0, 0, 0
-
-        used_links = np.where(tree > 0)[0]
-        if used_links.size > 0:
-            bw_ref_count = state.get('bw_ref_count', np.zeros(self.link_num))  # 安全获取
-            new_links_mask = (bw_ref_count[used_links] == 0)
-            bw_cost = np.sum(new_links_mask) * request['bw_origin']
-
-        for node, vnf_t in np.argwhere(hvt > 0):
-            if state['hvt'][node, vnf_t] == 0:
-                try:
-                    j = request['vnf'].index(vnf_t + 1)
-                    cpu_cost += request['cpu_origin'][j]
-                    mem_cost += request['memory_origin'][j]
-                except ValueError:
-                    pass
-
-        # 修复: 定义归一化权重
-        # 权重设计原则:
-        # - 带宽是共享资源，权重较低
-        # - CPU和内存是节点独占资源，权重较高
-        # - 归一化到容量，使不同资源类型可比较
-
-        bw_weight = 1.0 / self.bandwidth_capacity  # 归一化到 [0, 1]
-        cpu_weight = 10.0 / self.cpu_capacity  # CPU更重要
-        mem_weight = 10.0 / self.memory_capacity  # 内存同样重要
-
-        # 计算归一化成本
-        total_cost = (bw_cost * bw_weight) + (cpu_cost * cpu_weight) + (mem_cost * mem_weight)
-
-        # 归一化到 [0, 10] 范围，便于奖励函数处理
-        # 假设最坏情况：使用所有资源
-        max_possible_cost = (
-                self.link_num * self.bandwidth_capacity * bw_weight +
-                self.dc_num * self.cpu_capacity * cpu_weight +
-                self.dc_num * self.memory_capacity * mem_weight
-        )
-
-        # 避免除以零
-        if max_possible_cost == 0:
+    # --- 核心评分逻辑 ---
+    def _calc_path_eval(self, nodes: List[int], links: List[int],
+                        state: Dict, src_node: int, dst_node: int) -> float:
+        """计算路径评分"""
+        if not nodes:
             return 0.0
 
-        normalized_cost = (total_cost / max_possible_cost) * 10.0
-        return np.clip(normalized_cost, 0, 10)
+        # ✅ 标准化状态
+        state = self._normalize_state(state)
 
-    def _calc_atnp(self, tree1: Dict, tree1_path: List[int], d_idx: int,
-                   state: Dict, nodes_on_tree: Set[int]):
+        max_hops = self._get_max_hops(src_node, dst_node)
+        current_hops = len(nodes) - 1
+        term1 = 1.0 - (current_hops / max(1, max_hops))
+
+        dc_count = sum(1 for n in nodes if n in self.DC)
+        term2 = dc_count / max(1, self.dc_num)
+
+        sr_val = 0.0
+        for n in nodes:
+            if n in self.DC:
+                idx = n - 1
+                if idx < len(state['cpu']):
+                    cpu_remain = state['cpu'][idx]
+                    mem_remain = state['mem'][idx]
+                    sr_val += (cpu_remain + mem_remain) / (self.cap_cpu + self.cap_mem)
+
+        for lid in links:
+            idx = lid - 1
+            if idx < len(state['bw']):
+                bw_remain = state['bw'][idx]
+                sr_val += bw_remain / self.cap_bw
+
+        norm_factor = max(1, len(nodes) + len(links))
+        term3 = sr_val / norm_factor
+
+        return float(ALPHA * term1 + BETA * term2 + GAMMA * term3)
+
+    def _try_deploy_vnf(self, request: Dict, path_nodes: List[int],
+                        state: Dict, existing_hvt: np.ndarray) -> Tuple[bool, np.ndarray, Dict]:
+        """尝试在路径上部署VNF"""
+        # ✅ 标准化状态
+        state = self._normalize_state(state)
+
+        req_vnfs = request['vnf']
+        hvt = existing_hvt.copy()
+        placement = {}
+        path_dcs = [n for n in path_nodes if n in self.DC]
+
+        if len(path_dcs) < len(req_vnfs):
+            return False, existing_hvt, {}
+
+        current_dc_idx = 0
+
+        for v_idx, v_type in enumerate(req_vnfs):
+            deployed = False
+
+            # 1. 尝试复用现有VNF
+            for node in path_dcs:
+                node_idx = node - 1
+                if node_idx < hvt.shape[0] and (v_type - 1) < hvt.shape[1]:
+                    if hvt[node_idx, v_type - 1] > 0:
+                        placement[v_idx] = node
+                        deployed = True
+                        break
+
+            if deployed:
+                continue
+
+            # 2. 尝试新部署
+            start_search = current_dc_idx
+            while start_search < len(path_dcs):
+                node = path_dcs[start_search]
+                node_idx = node - 1
+
+                if node_idx >= len(state['cpu']):
+                    start_search += 1
+                    continue
+
+                cpu_req = request['cpu_origin'][v_idx]
+                mem_req = request['memory_origin'][v_idx]
+
+                if state['cpu'][node_idx] >= cpu_req and state['mem'][node_idx] >= mem_req:
+                    # ✅ 临时占用资源 (不修改原状态)
+                    hvt[node_idx, v_type - 1] = 1
+                    placement[v_idx] = node
+                    deployed = True
+                    current_dc_idx = start_search + 1
+                    break
+                else:
+                    start_search += 1
+
+            if not deployed:
+                return False, existing_hvt, {}
+
+        return True, hvt, placement
+
+    # ============================================
+    # ✅ 修复: 环境调用接口 (_calc_eval)
+    # ============================================
+    def _calc_eval(self, request: Dict, d_idx: int, k: int, state: Dict):
         """
-        (专家函数): 找到将目的节点 d 连接到树 tree1 的最佳方案
+        Stage 1: Source -> Dest
+        返回值与原版兼容: (score, nodes, tree_vec, hvt, feasible, dst, cost, placement)
         """
-        request = state['request']
+        # ✅ 标准化状态
+        state = self._normalize_state(state)
 
-        if tree1.get('eval', 0) == 0:
-            return {
-                'tree': tree1['tree'].copy(), 'hvt': tree1['hvt'].copy(),
-                'feasible': tree1.get('feasible', False),
-                'infeasible_dest': tree1.get('infeasible_dest', 0)
-            }, 0, (0, 0), 0  # (plan, eval, action, cost)
+        src = request['source']
+        dst = request['dest'][d_idx]
+        nodes, dist, links = self._get_path_info(src, dst, k)
 
-        best_eval = -1
-        best_plan = None
-        best_action = (0, 0)  # (i_idx, k)
-        best_cost = 0
+        if not nodes:
+            return (0.0, [], np.zeros(self.link_num),
+                    np.zeros((self.node_num, self.type_num)),
+                    False, dst, 0.0, {})
 
-        # 遍历树上的所有可能连接点 (i_idx)
-        for i_idx in range(len(tree1_path)):
-            # 遍历 K 条路径 (k)
-            for k in range(1, self.k_path_count + 1):
-                eval_val, paths, tree_new, hvt_new, feasible, infeasible_dest, cost = \
-                    self._calc_eval1(
-                        d_idx, k, i_idx, tree1_path, request,
-                        tree1['hvt'], state, nodes_on_tree
+        # 计算评分
+        score = self._calc_path_eval(nodes, links, state, src, dst)
+
+        # 尝试部署
+        temp_state = copy.deepcopy(state)
+        initial_hvt = np.zeros((self.node_num, self.type_num))
+        feasible, new_hvt, placement = self._try_deploy_vnf(
+            request, nodes, temp_state, initial_hvt
+        )
+
+        # 构建树向量
+        tree_vec = np.zeros(self.link_num)
+        if feasible:
+            for lid in links:
+                if lid - 1 < len(tree_vec):
+                    tree_vec[lid - 1] = 1
+
+        # 简单成本估算
+        cost = np.sum(tree_vec) * 0.2 + np.sum(new_hvt) * 0.8 if feasible else 0.0
+
+        return score, nodes, tree_vec, new_hvt, feasible, dst, cost, placement
+
+    # ============================================
+    # ✅ 修复: _calc_atnp (用于环境的查询接口)
+    # ============================================
+    def _calc_atnp(self, current_tree: Dict, conn_path: List[int],
+                   d_idx: int, state: Dict, nodes_on_tree: Set[int]):
+        """
+        Stage 2: Tree Path -> Dest
+        返回: (result_dict, eval, action_tuple, cost)
+        """
+        # ✅ 标准化状态
+        state = self._normalize_state(state)
+
+        # 获取请求
+        request = state.get('request')
+        if request is None:
+            return {'feasible': False}, 0.0, (0, 0), 0.0
+
+        best_eval = -1.0
+        best_res = None
+        best_action = (0, 0)
+
+        for i_idx, conn_node in enumerate(conn_path):
+            for k in range(1, self.k_path + 1):
+                nodes, dist, links = self._get_path_info(
+                    conn_node, request['dest'][d_idx], k
+                )
+
+                if not nodes or len(nodes) < 2:
+                    continue
+
+                # 检查是否形成环路
+                if set(nodes[1:]) & nodes_on_tree:
+                    continue
+
+                # 计算评分
+                score = self._calc_path_eval(nodes, links, state, conn_node, request['dest'][d_idx])
+
+                if score > best_eval:
+                    temp_state = copy.deepcopy(state)
+                    temp_state['request'] = request
+
+                    # 完整路径用于VNF部署检查
+                    full_nodes = conn_path[:i_idx + 1] + nodes[1:]
+
+                    # 获取现有HVT
+                    existing_hvt = current_tree.get('hvt', current_tree.get('hvt_vec',
+                                                                            np.zeros((self.node_num, self.type_num))))
+
+                    feasible, new_hvt, placement = self._try_deploy_vnf(
+                        request, full_nodes, temp_state, existing_hvt
                     )
 
-                if feasible and eval_val > best_eval:
-                    best_eval = eval_val
-                    best_action = (i_idx, k - 1)  # (0-indexed)
-                    best_cost = cost
-                    best_plan = {
-                        'tree': tree_new, 'hvt': hvt_new, 'new_path_full': paths,
-                        'connect_idx': i_idx, 'feasible': True, 'infeasible_dest': 0
-                    }
+                    if feasible:
+                        best_eval = score
+                        tree_vec = np.zeros(self.link_num)
+                        for lid in links:
+                            if lid - 1 < len(tree_vec):
+                                tree_vec[lid - 1] = 1
 
-        if best_plan is None:
-            return {
-                'tree': tree1['tree'].copy(), 'hvt': tree1['hvt'].copy(),
-                'feasible': False, 'infeasible_dest': request['dest'][d_idx]
-            }, 0, (0, 0), 0
+                        best_res = {
+                            'tree': tree_vec,
+                            'hvt': new_hvt,
+                            'new_path_full': nodes,
+                            'feasible': True,
+                            'placement': placement
+                        }
+                        best_action = (i_idx, k - 1)
 
-        return best_plan, best_eval, best_action, best_cost
+        if best_res:
+            cost = np.sum(best_res['tree']) * 0.2 + np.sum(best_res['hvt']) * 0.8
+            return best_res, best_eval, best_action, cost
+        else:
+            return {'feasible': False}, 0.0, (0, 0), 0.0
 
-    def solve_request_for_expert(self, request: Dict, network_state: Dict) -> \
-            Tuple[Optional[Dict], List[Tuple[int, Tuple[int, int], float]]]:
+    # ============================================
+    # ✅ 修复: 专家主流程
+    # ============================================
+    def solve_request_for_expert(self, request: Dict, network_state: Dict) -> Tuple[Optional[Dict], List]:
         """
-        (专家函数): 运行 MSFC-CE 算法并记录"专家决策"
-        返回: (最终方案, 轨迹)
-        轨迹 = [(high_level_goal, low_level_action, cost), ...]
+        执行专家算法并生成训练轨迹
+        返回: (solution_tree, trajectory)
+        trajectory = [(goal_idx, action_tuple, cost), ...]
         """
-        dest_num = len(request['dest'])
+        # ✅ 标准化状态
+        network_state = self._normalize_state(network_state)
         network_state['request'] = request
 
-        # (高层, 低层, 成本) 轨迹
-        expert_trajectory = []
+        temp_state = copy.deepcopy(network_state)
 
-        # 阶段1: 找到所有 S->d 的最佳路径
-        tree_set = []
-        best_k_set = []
-        best_cost_set = []
-        for d_idx in range(dest_num):
-            best_eval, best_result, best_k, best_cost = -1, None, 0, 0
-            for k in range(1, self.k_path_count + 1):
-                eval_val, paths, tree, hvt, feasible, _, cost = self._calc_eval(
-                    request, d_idx, k, network_state)
-                if feasible and eval_val > best_eval:
-                    best_eval, best_k, best_cost = eval_val, (k - 1), cost
-                    best_result = {
-                        'eval': eval_val, 'paths': paths, 'tree': tree, 'hvt': hvt
-                    }
-            tree_set.append(best_result if best_result else {'eval': -1})
-            best_k_set.append(best_k)
-            best_cost_set.append(best_cost)
-
-        # 贪心构建多播树
-        best_d_idx = np.argmax([t.get('eval', -1) for t in tree_set])
-        if tree_set[best_d_idx]['eval'] <= 0:
-            return None, []  # 阻塞
-
-        # 记录第一个高层和低层决策
-        high_level_goal = best_d_idx
-        low_level_action = (0, best_k_set[best_d_idx])
-        cost = best_cost_set[best_d_idx]
-        expert_trajectory.append((high_level_goal, low_level_action, cost))
-
+        # 初始化树结构
         current_tree = {
             'id': request['id'],
-            'tree': tree_set[best_d_idx]['tree'],
-            'hvt': tree_set[best_d_idx]['hvt'],
-            'paths_map': {request['dest'][best_d_idx]: tree_set[best_d_idx]['paths']}
-        }
-        nodes_on_tree = set(tree_set[best_d_idx]['paths'])
-        unadded = set(range(dest_num)) - {best_d_idx}
-
-        # ----------------------------------------------------
-        # 修复 #3: (补丁 3)
-        # ----------------------------------------------------
-
-        # 创建局部状态副本 (已应用补丁 3)
-        local_network_state = {
-            'bw': network_state['bw'].copy(),
-            'cpu': network_state['cpu'].copy(),
-            'mem': network_state['mem'].copy(),
-            'hvt': network_state['hvt'].copy(),
-            'bw_ref_count': network_state.get('bw_ref_count', np.zeros(len(network_state['bw']))).copy(),
-            'request': request
+            'tree': np.zeros(self.link_num),  # ✅ 使用 'tree' 而非 'tree_vec'
+            'hvt': np.zeros((self.node_num, self.type_num)),  # ✅ 使用 'hvt'
+            'paths_map': {},
+            'added_dest_indices': []
         }
 
-        while unadded:
-            best_eval, best_plan, best_d, best_action, best_cost = -1, None, -1, (0, 0), 0
+        nodes_on_tree = {request['source']}
+        trajectory = []
+
+        dest_indices = list(range(len(request['dest'])))
+        unadded = set(dest_indices)
+
+        # ============================================
+        # 阶段 1: 选择最佳初始路径 (S -> D)
+        # ============================================
+        if unadded:
+            best_score = -1
+            best_d_idx = -1
+            best_k = -1
+            best_data = None
 
             for d_idx in unadded:
-                # 遍历所有已在树上的路径，看从哪里连接
+                for k in range(1, self.k_path + 1):
+                    score, nodes, tree_vec, hvt, feasible, _, cost, placement = \
+                        self._calc_eval(request, d_idx, k, temp_state)
+
+                    if feasible and score > best_score:
+                        best_score = score
+                        best_d_idx = d_idx
+                        best_k = k
+                        best_data = (nodes, tree_vec, hvt, cost, placement)
+
+            if best_d_idx == -1:
+                # 无法找到任何可行路径
+                return None, []
+
+            # 应用最佳初始路径
+            nodes, tree_vec, hvt, cost, placement = best_data
+            current_tree['tree'] = tree_vec
+            current_tree['hvt'] = hvt
+            current_tree['paths_map'][request['dest'][best_d_idx]] = nodes
+            current_tree['added_dest_indices'].append(best_d_idx)
+            nodes_on_tree.update(nodes)
+
+            # 更新临时状态
+            self._apply_deployment_to_state(request, tree_vec, hvt, temp_state)
+
+            # 记录轨迹
+            action_tuple = (0, best_k - 1)  # (path_idx, k_idx)
+            trajectory.append((best_d_idx, action_tuple, cost))
+
+            unadded.remove(best_d_idx)
+
+        # ============================================
+        # 阶段 2: 迭代添加剩余目的地
+        # ============================================
+        while unadded:
+            best_eval = -1
+            best_d = -1
+            best_plan = None
+            best_action = (0, 0)
+            best_cost = 0
+
+            for d_idx in unadded:
+                # 遍历所有已在树上的路径
                 for conn_path in current_tree['paths_map'].values():
-                    t, m, action, cost = self._calc_atnp(
-                        {'tree': current_tree['tree'].copy(), 'hvt': current_tree['hvt'].copy()},
-                        conn_path, d_idx, local_network_state, nodes_on_tree  # 使用本地状态
+                    plan, eval_val, action, cost = self._calc_atnp(
+                        current_tree, conn_path, d_idx, temp_state, nodes_on_tree
                     )
-                    if t.get('feasible') and m > best_eval:
-                        best_eval, best_plan, best_d = m, t, d_idx
-                        best_action, best_cost = action, cost
+
+                    if plan.get('feasible') and eval_val > best_eval:
+                        best_eval = eval_val
+                        best_d = d_idx
+                        best_plan = plan
+                        best_action = action
+                        best_cost = cost
 
             if best_d == -1:
-                # 修复: (方案 2) 停止尝试分支，但返回已经成功的主干轨迹
-                break  # 阻塞
+                # 无法继续扩展
+                break
 
-            # 记录后续的高层和低层决策
-            high_level_goal = best_d
-            low_level_action = best_action  # (i_idx, k_idx)
-            cost = best_cost
-            expert_trajectory.append((high_level_goal, low_level_action, cost))
-
-            # 合并树
-            current_tree['tree'] = np.logical_or(current_tree['tree'], best_plan['tree']).astype(float)
-            current_tree['hvt'] = np.maximum(current_tree['hvt'], best_plan['hvt'])
+            # 应用最佳分支
+            current_tree['tree'] = np.logical_or(
+                current_tree['tree'], best_plan['tree']
+            ).astype(float)
+            current_tree['hvt'] = np.maximum(
+                current_tree['hvt'], best_plan['hvt']
+            )
             current_tree['paths_map'][request['dest'][best_d]] = best_plan['new_path_full']
+            current_tree['added_dest_indices'].append(best_d)
             nodes_on_tree.update(best_plan['new_path_full'])
+
+            # 更新临时状态
+            self._apply_deployment_to_state(request, best_plan['tree'], best_plan['hvt'], temp_state)
+
+            # 记录轨迹
+            trajectory.append((best_d, best_action, best_cost))
+
             unadded.remove(best_d)
 
-            # 修复 #4: 临时在 local_network_state 上应用资源变化
-            for link_idx in np.where(best_plan['tree'] > 0)[0]:
-                if local_network_state['bw_ref_count'][link_idx] == 0:
-                    local_network_state['bw'][link_idx] -= request['bw_origin']
-                local_network_state['bw_ref_count'][link_idx] += 1
+        # 检查是否完成所有目的地
+        if unadded:
+            return None, []
 
-            for node, vnf_t in np.argwhere(best_plan['hvt'] > 0):
-                if local_network_state['hvt'][node, vnf_t] == 0:
-                    try:
-                        j = request['vnf'].index(vnf_t + 1)
-                        local_network_state['cpu'][node] -= request['cpu_origin'][j]
-                        local_network_state['mem'][node] -= request['memory_origin'][j]
-                    except ValueError:
-                        pass
-                # 修复 #3 (补丁 3): 确保 HVT 是累加的
-                local_network_state['hvt'][node, vnf_t] += 1
+        return current_tree, trajectory
 
-        return current_tree, expert_trajectory
+    def _apply_deployment_to_state(self, request: Dict, tree_vec: np.ndarray,
+                                   hvt: np.ndarray, state: Dict):
+        """将部署应用到状态 (用于模拟)"""
+        # 占用带宽
+        for lid_idx, used in enumerate(tree_vec):
+            if used > 0 and lid_idx < len(state['bw']):
+                if state['bw_ref_count'][lid_idx] == 0:
+                    state['bw'][lid_idx] -= request['bw_origin']
+                state['bw_ref_count'][lid_idx] += 1
+
+        # 占用CPU/内存
+        for node_idx in range(hvt.shape[0]):
+            for vnf_idx in range(hvt.shape[1]):
+                if hvt[node_idx, vnf_idx] > 0 and state['hvt'][node_idx, vnf_idx] == 0:
+                    vnf_type = vnf_idx + 1
+                    if vnf_type in request['vnf']:
+                        try:
+                            req_idx = request['vnf'].index(vnf_type)
+                            state['cpu'][node_idx] -= request['cpu_origin'][req_idx]
+                            state['mem'][node_idx] -= request['memory_origin'][req_idx]
+                        except:
+                            pass
+                    state['hvt'][node_idx, vnf_idx] += 1
+
+
+if __name__ == "__main__":
+    print("✅ 专家模块加载成功")

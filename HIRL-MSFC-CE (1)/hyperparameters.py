@@ -6,8 +6,8 @@ import numpy as np
 from pathlib import Path
 
 # --- 1. 路径和环境配置 ---
-INPUT_DIR = Path('G:/pySfc/_._.-master/_._.-master/HIRL-MSFC-CE/mat')
-OUTPUT_DIR = Path('G:/pySfc/_._.-master/_._.-master/HIRL-MSFC-CE/out_hirl')
+INPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\mat')
+OUTPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\out_hirl')
 
 CAPACITIES = {
     'cpu': 200.0,

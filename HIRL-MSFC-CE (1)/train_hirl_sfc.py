@@ -1,7 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # @File    : train_hirl_sfc.py
+# ---------- Defensive patch: ensure IPython has expected attrs ----------
+# Put this BEFORE any `import matplotlib` / `import matplotlib.pyplot` / from matplotlib.figure import Figure
+try:
+    import importlib
 
+    # only try to import IPython if present; do NOT force-install
+    spec = importlib.util.find_spec("IPython")
+    if spec is not None:
+        import IPython
+
+        # If IPython is present but missing attributes used by matplotlib, add safe defaults
+        if not hasattr(IPython, "version_info"):
+            # Matplotlib only needs to compare a tuple slice like version_info[:2],
+            # provide a minimal tuple so comparisons won't error.
+            IPython.version_info = (0, 0, 0)
+        if not hasattr(IPython, "get_ipython"):
+            IPython.get_ipython = lambda: None
+except Exception:
+    # Any errors here are non-fatal; continue without IPython
+    pass
+# ---------------------------------------------------------------------
+import matplotlib.pyplot as plt
+
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定中文字体
+plt.rcParams['axes.unicode_minus'] = False  # 解决坐标轴负号乱码
 import numpy as np
 from collections import namedtuple
 import os
@@ -11,8 +35,7 @@ import os
 # ---
 import matplotlib
 
-matplotlib.use('Agg')  # <-- 修复: 在导入 pyplot 之前设置后端
-# import matplotlib.pyplot as plt # <--- 修复: 已被 'save_training_plots' 中的面向对象 API 替代
+matplotlib.use('Agg')  # 关键！避免所有 IPython 相关错误
 import pandas as pd
 
 # 修复: (补丁 9) 导入新的 Matplotlib 模块
@@ -97,24 +120,18 @@ def validate_configuration():
 logger = logging.getLogger(__name__)
 
 
-def is_interactive_environment():
-    """
-    安全检测是否在交互式环境（Jupyter/IPython）中。
-    (来自用户的建议)
-    """
-    try:
-        import IPython
-        get_ip = getattr(IPython, "get_ipython", None)
-        return get_ip is not None and get_ip() is not None
-    except Exception:
-        return False
-
-
 def save_training_plots(metrics_csv_path: str, out_dir: str):
     """
-    (最终修复版) 读取 CSV 并使用面向对象的 Matplotlib API 保存图表，
-    以 100% 避免 'pyplot' 和 'IPython' 错误。
+    (最终修复版) 读取 CSV 并使用面向对象的 Matplotlib API 保存图表。
+    已添加针对 'IPython.version_info' 错误的临时补丁。
     """
+    # --- 补丁开始: 临时隐藏 IPython 以绕过 matplotlib 的版本检查错误 ---
+    import sys
+    original_ipython = sys.modules.get('IPython')
+    if 'IPython' in sys.modules:
+        del sys.modules['IPython']
+    # ------------------------------------------------------------
+
     try:
         if not os.path.exists(metrics_csv_path):
             logger.warning("训练指标 CSV 未找到，跳过绘图: %s", metrics_csv_path)
@@ -147,6 +164,7 @@ def save_training_plots(metrics_csv_path: str, out_dir: str):
             # 2. 在 Axes 上绘图
             if use_smooth:
                 ax.plot(df[col].values, alpha=0.3, label='原始')
+                # 确保平滑窗口不超过数据长度
                 ax.plot(smooth(df[col].values), label='平滑 (窗口=100)', linewidth=2)
                 ax.legend()
             else:
@@ -168,6 +186,9 @@ def save_training_plots(metrics_csv_path: str, out_dir: str):
         # --- 绘图 ---
         do_plot('reward', title='回合奖励', ylabel='Reward', use_smooth=True)
         do_plot('acceptance_rate', title='请求接受率', ylabel='Acceptance Rate (%)')
+        # ✅ 新增: 阻塞率绘图
+        do_plot('blocking_rate', title='业务请求阻塞率', ylabel='Blocking Rate (%)')
+
         do_plot('avg_cpu_util', title='CPU 利用率', ylabel='Avg Util (%)', use_smooth=True)
         do_plot('avg_mem_util', title='内存 利用率', ylabel='Avg Util (%)', use_smooth=True)
         do_plot('avg_bw_util', title='带宽 利用率', ylabel='Avg Util (%)', use_smooth=True)
@@ -179,6 +200,11 @@ def save_training_plots(metrics_csv_path: str, out_dir: str):
         logger.exception("生成图表失败: %s", e)
         return False
 
+    finally:
+        # --- 补丁结束: 恢复 IPython ---
+        if original_ipython:
+            sys.modules['IPython'] = original_ipython
+
 
 def save_training_data_safely(tracking_data, output_dir):
     """安全保存训练数据并调用绘图"""
@@ -186,7 +212,7 @@ def save_training_data_safely(tracking_data, output_dir):
     try:
         # 1. 检查数据是否为空
         if not tracking_data or all(len(v) == 0 for v in tracking_data.values()):
-            logger.warning("没有收集到训练数据, 无法保存 CSV 或绘图")  # (Emoji removed)
+            logger.warning("没有收集到训练数据, 无法保存 CSV 或绘图")
             return False
 
         # 2. 保存 CSV
@@ -240,7 +266,9 @@ def main_improved():
 
     # (定义 tracking_data 和 hdqn_net 在 try 块之外，以便 finally 可以访问)
     tracking_data = {
-        'episode': [], 'reward': [], 'acceptance_rate': [],
+        'episode': [], 'reward': [],
+        'acceptance_rate': [],
+        'blocking_rate': [],  # ✅ 新增: 记录阻塞率
         'avg_cpu_util': [], 'avg_mem_util': [], 'avg_bw_util': []
     }
     hdqn_net = None
@@ -271,13 +299,6 @@ def main_improved():
             gamma=H.GAMMA
         )
         low_level_agent.compile()  # 构建 Keras 训练模型
-
-        # ----------------------------------------------------
-        # ✅ 修复: (补丁 E / 你的建议) 临时硬编码 Epsilon 进行测试
-        # ----------------------------------------------------
-        # low_level_agent.controllerEpsilon = 0.1 # <-- 在这里取消注释以进行测试
-        # if low_level_agent.controllerEpsilon != 1.0:
-        #     logger.info(f"调试: 已硬编码 Epsilon = {low_level_agent.controllerEpsilon}")
 
         logger.info(f"状态向量大小: {STATE_SHAPE}")
         logger.info(f"高层目标(子任务)数量: {NB_GOALS}")
@@ -482,12 +503,19 @@ def main_improved():
 
                 tracking_data['episode'].append(episodeCount)
                 tracking_data['reward'].append(episode_reward)
-                # ----------------------------------------------------
-                # ✅ 修复: (补丁 C) 使用 env 中的新计数器
-                # ----------------------------------------------------
-                req_accept_rate = (env.total_requests_accepted / max(1, env.total_requests_seen)) * 100.0
+
+                # --- 计算并记录阻塞率和接受率 ---
+                total_reqs = max(1, env.total_requests_seen)
+                req_accept_rate = (env.total_requests_accepted / total_reqs) * 100.0
+
+                # 阻塞请求数 sr = 总请求数 s - 成功部署数
+                blocked_requests = env.total_requests_seen - env.total_requests_accepted
+                blocking_rate = (blocked_requests / total_reqs) * 100.0
+
                 dest_accept_rate = (env.total_dest_accepted / max(1, env.total_dest_seen)) * 100.0
-                tracking_data['acceptance_rate'].append(req_accept_rate)  # (保留旧列名，但使用新数据)
+
+                tracking_data['acceptance_rate'].append(req_accept_rate)
+                tracking_data['blocking_rate'].append(blocking_rate)  # ✅ 记录阻塞率
 
                 tracking_data['avg_cpu_util'].append(avg_cpu_util)
                 tracking_data['avg_mem_util'].append(avg_mem_util)
@@ -497,11 +525,12 @@ def main_improved():
                 logger.info(f"总步数: {stepCount}, Epsilon: {low_level_agent.controllerEpsilon:.4f}")
                 logger.info(f"回合奖励: {episode_reward:.3f}, 回合步数: {episode_steps}")
 
-                # ----------------------------------------------------
-                # ✅ 修复: (补丁 C) 打印两个新指标
-                # ----------------------------------------------------
                 logger.info(
                     f"当前接受率(完整请求): {req_accept_rate:.2f}% ({env.total_requests_accepted}/{env.total_requests_seen})")
+                # ✅ 打印阻塞率
+                logger.info(
+                    f"当前阻塞率: {blocking_rate:.2f}% ({blocked_requests}/{env.total_requests_seen})")
+
                 logger.info(
                     f"当前接受率(按目的地): {dest_accept_rate:.2f}% ({env.total_dest_accepted}/{env.total_dest_seen})")
                 logger.info(
