@@ -47,8 +47,8 @@ from tensorflow.keras.utils import to_categorical
 
 class H:
     # --- 1. 路径和环境配置 ---
-    INPUT_DIR = Path('E:/pycharmworkspace/SFC-master/HIRL-MSFC-CE/mat')
-    OUTPUT_DIR = Path('E:/pycharmworkspace/SFC-master/HIRL-MSFC-CE/out_hirl')
+    INPUT_DIR = Path('/HIRL-MSFC-CE备份/mat')
+    OUTPUT_DIR = Path('/HIRL-MSFC-CE备份/out_hirl')
 
     CAPACITIES = {
         'cpu': 2000.0,
