@@ -254,19 +254,35 @@ class SFC_HIRL_Env(gym.Env):
         remaining = []
         for req, tree in self.served_requests:
             if req['id'] in leave_set:
+                bw_to_return = float(req.get('bw_origin', 0.0))
+                # 遍历树上的每条链路 —— 先 decrement, 当计数变为0时才归还带宽
                 for link_idx in np.where(tree['tree'] > 0)[0]:
-                    self.B[link_idx] += req.get('bw_origin', 0.0)
+                    # 防御性：若计数为0但我们需要释放，记录警告并尝试修正
+                    if self.link_ref_count[link_idx] <= 0:
+                        # 说明可能存在之前的重复释放或计数不同步
+                        logger.warning(
+                            f"link_ref_count for link {link_idx} is non-positive ({self.link_ref_count[link_idx]}) when processing leave for req {req['id']}. Correcting to 0 before decrement.")
+                        # guard: set to 0 (so decrement does not go negative)
+                        self.link_ref_count[link_idx] = 0
+
+                    # 先减引用
                     if self.link_ref_count[link_idx] > 0:
                         self.link_ref_count[link_idx] -= 1
+
+                    # 只有当引用计数下降至 0 时，才把带宽归还
+                    if self.link_ref_count[link_idx] == 0:
+                        # add back, 并 clamp 在 [0, B_cap]
+                        self.B[link_idx] = min(self.B_cap, self.B[link_idx] + bw_to_return)
+                # 节点资源释放（保持原逻辑，但也做防御性检查）
                 for node, vnf_t in np.argwhere(tree['hvt'] > 0):
                     if self.hvt_all[node, vnf_t] > 0:
                         self.hvt_all[node, vnf_t] -= 1
                         if self.hvt_all[node, vnf_t] == 0:
                             try:
                                 j = req['vnf'].index(int(vnf_t + 1))
-                                self.C[node] += req['cpu_origin'][j]
-                                self.M[node] += req['memory_origin'][j]
-                            except:
+                                self.C[node] = min(self.C_cap, self.C[node] + req['cpu_origin'][j])
+                                self.M[node] = min(self.M_cap, self.M[node] + req['memory_origin'][j])
+                            except Exception:
                                 pass
             else:
                 remaining.append((req, tree))
@@ -585,25 +601,29 @@ class SFC_HIRL_Env(gym.Env):
         return self._get_flat_state(), float(cost_val), sub_task_done, request_done
 
     def _apply_deployment(self, request: Dict, plan: Dict):
-        """应用部署方案到网络状态"""
+        """应用部署方案到网络状态（带防御性检查）"""
         tree_branch = plan.get('tree', np.zeros(self.L))
         hvt_branch = plan.get('hvt', np.zeros((self.n, self.K_vnf)))
         self.current_tree['tree'] = np.logical_or(self.current_tree['tree'], tree_branch).astype(float)
 
-        # 链路资源扣除
+        bw_req = float(request.get('bw_origin', 0.0))
+
+        # 链路资源扣除：当引用计数为0时才真正扣带宽，然后无论如何引用计数+1
         for link_idx in np.where(tree_branch > 0)[0]:
             if self.link_ref_count[link_idx] == 0:
-                self.B[link_idx] -= request.get('bw_origin', 0.0)
+                # 防御性：不要把带宽扣到负值
+                new_bw = self.B[link_idx] - bw_req
+                self.B[link_idx] = max(0.0, new_bw)
             self.link_ref_count[link_idx] += 1
 
-        # 节点资源扣除
+        # 节点资源扣除（保持原有语义）
         for node, vnf_t in np.argwhere(hvt_branch > 0):
             if self.hvt_all[node, vnf_t] == 0:
                 try:
                     j = request['vnf'].index(int(vnf_t + 1))
-                    self.C[node] -= request['cpu_origin'][j]
-                    self.M[node] -= request['memory_origin'][j]
-                except:
+                    self.C[node] = max(0.0, self.C[node] - request['cpu_origin'][j])
+                    self.M[node] = max(0.0, self.M[node] - request['memory_origin'][j])
+                except Exception:
                     pass
             self.hvt_all[node, vnf_t] += 1
 

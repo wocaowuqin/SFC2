@@ -10,9 +10,9 @@ INPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\mat')
 OUTPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\out_hirl')
 
 CAPACITIES = {
-    'cpu': 200.0,
-    'memory': 110.0,
-    'bandwidth': 50.0
+    'cpu': 150.0,
+    'memory': 80.0,
+    'bandwidth': 70.0
 }
 
 DC_NODES = [1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 14, 17, 18, 19, 20, 21, 23, 24, 27, 28]

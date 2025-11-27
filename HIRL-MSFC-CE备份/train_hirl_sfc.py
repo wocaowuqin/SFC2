@@ -1,7 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # @File    : train_hirl_sfc.py
+# ---------- Defensive patch: ensure IPython has expected attrs ----------
+# Put this BEFORE any `import matplotlib` / `import matplotlib.pyplot` / from matplotlib.figure import Figure
+try:
+    import importlib
 
+    # only try to import IPython if present; do NOT force-install
+    spec = importlib.util.find_spec("IPython")
+    if spec is not None:
+        import IPython
+
+        # If IPython is present but missing attributes used by matplotlib, add safe defaults
+        if not hasattr(IPython, "version_info"):
+            # Matplotlib only needs to compare a tuple slice like version_info[:2],
+            # provide a minimal tuple so comparisons won't error.
+            IPython.version_info = (0, 0, 0)
+        if not hasattr(IPython, "get_ipython"):
+            IPython.get_ipython = lambda: None
+except Exception:
+    # Any errors here are non-fatal; continue without IPython
+    pass
+# ---------------------------------------------------------------------
+import matplotlib.pyplot as plt
+
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定中文字体
+plt.rcParams['axes.unicode_minus'] = False  # 解决坐标轴负号乱码
 import numpy as np
 from collections import namedtuple
 import os
@@ -11,8 +35,7 @@ import os
 # ---
 import matplotlib
 
-matplotlib.use('Agg')  # <-- 修复: 在导入 pyplot 之前设置后端
-# import matplotlib.pyplot as plt # <--- 修复: 已被 'save_training_plots' 中的面向对象 API 替代
+matplotlib.use('Agg')  # 关键！避免所有 IPython 相关错误
 import pandas as pd
 
 # 修复: (补丁 9) 导入新的 Matplotlib 模块
@@ -97,24 +120,18 @@ def validate_configuration():
 logger = logging.getLogger(__name__)
 
 
-def is_interactive_environment():
-    """
-    安全检测是否在交互式环境（Jupyter/IPython）中。
-    (来自用户的建议)
-    """
-    try:
-        import IPython
-        get_ip = getattr(IPython, "get_ipython", None)
-        return get_ip is not None and get_ip() is not None
-    except Exception:
-        return False
-
-
 def save_training_plots(metrics_csv_path: str, out_dir: str):
     """
-    (最终修复版) 读取 CSV 并使用面向对象的 Matplotlib API 保存图表，
-    以 100% 避免 'pyplot' 和 'IPython' 错误。
+    (最终修复版) 读取 CSV 并使用面向对象的 Matplotlib API 保存图表。
+    已添加针对 'IPython.version_info' 错误的临时补丁。
     """
+    # --- 补丁开始: 临时隐藏 IPython 以绕过 matplotlib 的版本检查错误 ---
+    import sys
+    original_ipython = sys.modules.get('IPython')
+    if 'IPython' in sys.modules:
+        del sys.modules['IPython']
+    # ------------------------------------------------------------
+
     try:
         if not os.path.exists(metrics_csv_path):
             logger.warning("训练指标 CSV 未找到，跳过绘图: %s", metrics_csv_path)
@@ -147,6 +164,7 @@ def save_training_plots(metrics_csv_path: str, out_dir: str):
             # 2. 在 Axes 上绘图
             if use_smooth:
                 ax.plot(df[col].values, alpha=0.3, label='原始')
+                # 确保平滑窗口不超过数据长度
                 ax.plot(smooth(df[col].values), label='平滑 (窗口=100)', linewidth=2)
                 ax.legend()
             else:
@@ -168,6 +186,9 @@ def save_training_plots(metrics_csv_path: str, out_dir: str):
         # --- 绘图 ---
         do_plot('reward', title='回合奖励', ylabel='Reward', use_smooth=True)
         do_plot('acceptance_rate', title='请求接受率', ylabel='Acceptance Rate (%)')
+        # ✅ 新增: 阻塞率绘图
+        do_plot('blocking_rate', title='业务请求阻塞率', ylabel='Blocking Rate (%)')
+
         do_plot('avg_cpu_util', title='CPU 利用率', ylabel='Avg Util (%)', use_smooth=True)
         do_plot('avg_mem_util', title='内存 利用率', ylabel='Avg Util (%)', use_smooth=True)
         do_plot('avg_bw_util', title='带宽 利用率', ylabel='Avg Util (%)', use_smooth=True)
@@ -179,6 +200,11 @@ def save_training_plots(metrics_csv_path: str, out_dir: str):
         logger.exception("生成图表失败: %s", e)
         return False
 
+    finally:
+        # --- 补丁结束: 恢复 IPython ---
+        if original_ipython:
+            sys.modules['IPython'] = original_ipython
+
 
 def save_training_data_safely(tracking_data, output_dir):
     """安全保存训练数据并调用绘图"""
@@ -186,7 +212,7 @@ def save_training_data_safely(tracking_data, output_dir):
     try:
         # 1. 检查数据是否为空
         if not tracking_data or all(len(v) == 0 for v in tracking_data.values()):
-            logger.warning("没有收集到训练数据, 无法保存 CSV 或绘图")  # (Emoji removed)
+            logger.warning("没有收集到训练数据, 无法保存 CSV 或绘图")
             return False
 
         # 2. 保存 CSV
@@ -240,7 +266,9 @@ def main_improved():
 
     # (定义 tracking_data 和 hdqn_net 在 try 块之外，以便 finally 可以访问)
     tracking_data = {
-        'episode': [], 'reward': [], 'acceptance_rate': [],
+        'episode': [], 'reward': [],
+        'acceptance_rate': [],
+        'blocking_rate': [],  # ✅ 新增: 记录阻塞率
         'avg_cpu_util': [], 'avg_mem_util': [], 'avg_bw_util': []
     }
     hdqn_net = None
@@ -272,168 +300,101 @@ def main_improved():
         )
         low_level_agent.compile()  # 构建 Keras 训练模型
 
-        # ----------------------------------------------------
-        # ✅ 修复: (补丁 E / 你的建议) 临时硬编码 Epsilon 进行测试
-        # ----------------------------------------------------
-        # low_level_agent.controllerEpsilon = 0.1 # <-- 在这里取消注释以进行测试
-        # if low_level_agent.controllerEpsilon != 1.0:
-        #     logger.info(f"调试: 已硬编码 Epsilon = {low_level_agent.controllerEpsilon}")
-
         logger.info(f"状态向量大小: {STATE_SHAPE}")
         logger.info(f"高层目标(子任务)数量: {NB_GOALS}")
         logger.info(f"低层动作数量: {NB_ACTIONS}")
 
         # --- 4. 阶段 1: 模仿学习 (预训练) ---
         logger.info(f"--- 3. 阶段 1: 模仿学习预训练 ( {H.PRE_TRAIN_STEPS} 步) ---")
-        # ✅ 新增: 初始化跟踪字典
-        tracking_data_pretrain = {
-            'step': [],
-            'requests_completed': [],
-            'memory_size': [],
-            'epsilon': []
-        }
+        # (我们假设 PRE_TRAIN_STEPS 已被设置为一个合理的值, e.g., 200)
         stepCount = 0
         current_request, high_level_state = env.reset_request()
 
-        # ✅ 新增: 跟踪统计
-        pretrain_complete_requests = 0
-        pretrain_partial_requests = 0
+        t = 0
+        failed_requests = 0  # (补丁 4)
 
-        while stepCount < H.PRE_TRAIN_STEPS:
-            try:
-                # 1. 检查是否有请求
+        while t < H.PRE_TRAIN_STEPS:
+            try:  # (补丁 4)
                 if current_request is None:
                     current_request, high_level_state = env.reset_request()
                     if current_request is None:
-                        logger.warning("没有更多请求,提前结束预训练")
+                        logger.warning("没有更多请求,提前结束预训练")  # (Emoji removed)
                         break
                     continue
 
-                # 2. 获取专家完整轨迹
+                # 获取专家轨迹
                 try:
                     _, expert_traj = env.expert.solve_request_for_expert(
                         current_request, env._get_network_state_dict()
                     )
                 except Exception as e:
                     logger.error(f"专家求解失败: {e}")
+                    failed_requests += 1
                     current_request, high_level_state = env.reset_request()
                     continue
 
-                # 3. 检查轨迹是否为空
                 if not expert_traj:
-                    pretrain_partial_requests += 1
-                    logger.debug(f"请求 {current_request['id']} 无法完全求解,跳过")
+                    failed_requests += 1
+                    if failed_requests % 100 == 0:
+                        logger.warning(f"警告: 已有 {failed_requests} 个请求失败")  # (Emoji removed)
                     current_request, high_level_state = env.reset_request()
                     continue
 
-                # ============================================
-                # ✅ 关键修复: 执行完整的专家轨迹
-                # ============================================
-                request_completed_successfully = False
+                failed_requests = 0  # 重置失败计数
 
+                # 遍历专家轨迹的所有步骤
                 for step_idx, (exp_goal, exp_action_tuple, exp_cost) in enumerate(expert_traj):
-                    # 检查目标是否仍然有效
                     if exp_goal not in env.unadded_dest_indices:
-                        logger.warning(f"步骤 {step_idx}: 目标 {exp_goal} 已完成或无效,跳过")
                         continue
 
-                    # 解码动作
                     exp_action = exp_action_tuple[0] * env.K_path + exp_action_tuple[1]
 
-                    # 执行动作
-                    next_high_level_state, cost, sub_task_done, request_done = \
-                        env.step_low_level(exp_goal, exp_action)
+                    # 在环境中执行
+                    next_high_level_state, cost, sub_task_done, request_done = env.step_low_level(exp_goal, exp_action)
 
-                    # 计算奖励
-                    reward = low_level_agent.criticize(
-                        sub_task_completed=sub_task_done,
-                        cost=cost,
-                        request_failed=False
-                    )
-
-                    # 存储经验
+                    # 存储
+                    reward = low_level_agent.criticize(sub_task_completed=True, cost=cost, request_failed=False)
                     goal_one_hot = to_categorical(exp_goal, num_classes=NB_GOALS)
-                    exp = ActorExperience(
-                        high_level_state, goal_one_hot, exp_action,
-                        reward, next_high_level_state, sub_task_done
-                    )
+                    exp = ActorExperience(high_level_state, goal_one_hot, exp_action, reward, next_high_level_state,
+                                          sub_task_done)
                     low_level_agent.store(exp)
 
                     # 训练
-                    if stepCount % low_level_agent.trainFreq == 0:
-                        low_level_agent.update(stepCount)
+                    if t % low_level_agent.trainFreq == 0:
+                        low_level_agent.update(t)
 
                     metacontroller.collect(high_level_state, exp_goal)
-                    if stepCount % H.META_TRAIN_FREQ == 0 and metacontroller.check_training_clock():
+                    if t % H.META_TRAIN_FREQ == 0 and metacontroller.check_training_clock():
                         metacontroller.train()
 
-                    # 更新状态
                     high_level_state = next_high_level_state
-                    stepCount += 1
+                    t += 1
 
-                    # ✅ 关键: 打印进度 (每100步)
-                    if stepCount % 100 == 0:
-                        logger.info(
-                            f"预训练进度: {stepCount}/{H.PRE_TRAIN_STEPS} "
-                            f"| 完整请求: {pretrain_complete_requests} "
-                            f"| 部分请求: {pretrain_partial_requests} "
-                            f"| Epsilon: {low_level_agent.controllerEpsilon:.4f}"
-                        )
-                        # ✅ 新增: 记录跟踪数据
-                        tracking_data_pretrain['step'].append(stepCount)
-                        tracking_data_pretrain['requests_completed'].append(pretrain_complete_requests)
-                        tracking_data_pretrain['memory_size'].append(len(low_level_agent.memory))
-                        tracking_data_pretrain['epsilon'].append(low_level_agent.controllerEpsilon)
-                    # 检查是否达到步数限制
-                    if stepCount >= H.PRE_TRAIN_STEPS:
-                        logger.info("达到预训练步数限制")
+                    if t % 1000 == 0:
+                        logger.info(f"预训练... {t}/{H.PRE_TRAIN_STEPS}")
+
+                    if t >= H.PRE_TRAIN_STEPS:  # 确保我们不会超出步数限制
                         break
 
-                    # ✅ 关键: 只有在完成整个请求后才重置
                     if request_done:
-                        request_completed_successfully = True
-                        logger.debug(
-                            f"请求 {current_request['id']} 完成 "
-                            f"(轨迹长度: {len(expert_traj)}, 执行步数: {step_idx + 1})"
-                        )
                         break
 
-                # 4. 记录请求完成状态
-                if request_completed_successfully:
-                    pretrain_complete_requests += 1
-                else:
-                    pretrain_partial_requests += 1
-
-                # 5. 重置到下一个请求
+                # 预训练循环后重置请求
                 current_request, high_level_state = env.reset_request()
 
             except Exception as e:
                 logger.error(f"预训练循环出错: {e}")
-                import traceback
                 traceback.print_exc()
+                # 尝试恢复
                 current_request, high_level_state = env.reset_request()
                 continue
 
-        # 打印预训练总结
-        logger.info(f"预训练完成:")
-        logger.info(f"  总步数: {stepCount}")
-        logger.info(f"  完整请求: {pretrain_complete_requests}")
-        logger.info(f"  部分请求: {pretrain_partial_requests}")
-        logger.info(f"  经验缓冲区大小: {len(low_level_agent.memory)}")
-        # ✅ 新增: 在预训练结束后保存
-        try:
-            df_pretrain = pd.DataFrame(tracking_data_pretrain)
-            # 假设 H.OUTPUT_DIR 是一个 Pathlib 对象
-            output_path = H.OUTPUT_DIR / "pretrain_metrics.csv"
-            df_pretrain.to_csv(output_path, index=False)
-            logger.info(f"预训练指标已保存到: {output_path}")
-        except Exception as e:
-            logger.warning(f"保存预训练指标失败: {e}")
+        logger.info(f"预训练完成: {t} 步, {failed_requests} 个失败请求")
+
         # --- 4. 阶段 2: 混合 IL/RL 训练 ---
         logger.info("--- 4. 阶段 2: 混合 IL/RL 训练 ---")
         low_level_agent.randomPlay = False
-        stepCount = stepCount  # 从预训练的步数继续
-        logger.info(f"从预训练步数 {stepCount} 继续...")
+        stepCount = t  # 从预训练的步数继续
         episodeCount = 0
         # total_requests_arrived = 0 (已在 env 中)
         # total_requests_served = 0 (已在 env 中)
@@ -474,14 +435,7 @@ def main_improved():
                         continue
 
                     goal_one_hot = np.reshape(to_categorical(goal, num_classes=NB_GOALS), (1, -1))
-                    # ✅ 新增: 检查是否因时间耗尽而未完成
-                    if env.t >= env.T and env.unadded_dest_indices:
-                        logger.warning(
-                            f"请求 {current_request['id']} 因仿真时间耗尽而未完成。"
-                            f"剩余 {len(env.unadded_dest_indices)} 个目的地。"
-                        )
-                        request_done = True  # 强制结束
-                        break
+
                     # --- B. 低层执行 (代理) ---
                     sub_task_done = False
                     low_level_state = high_level_state
@@ -549,12 +503,19 @@ def main_improved():
 
                 tracking_data['episode'].append(episodeCount)
                 tracking_data['reward'].append(episode_reward)
-                # ----------------------------------------------------
-                # ✅ 修复: (补丁 C) 使用 env 中的新计数器
-                # ----------------------------------------------------
-                req_accept_rate = (env.total_requests_accepted / max(1, env.total_requests_seen)) * 100.0
+
+                # --- 计算并记录阻塞率和接受率 ---
+                total_reqs = max(1, env.total_requests_seen)
+                req_accept_rate = (env.total_requests_accepted / total_reqs) * 100.0
+
+                # 阻塞请求数 sr = 总请求数 s - 成功部署数
+                blocked_requests = env.total_requests_seen - env.total_requests_accepted
+                blocking_rate = (blocked_requests / total_reqs) * 100.0
+
                 dest_accept_rate = (env.total_dest_accepted / max(1, env.total_dest_seen)) * 100.0
-                tracking_data['acceptance_rate'].append(req_accept_rate)  # (保留旧列名，但使用新数据)
+
+                tracking_data['acceptance_rate'].append(req_accept_rate)
+                tracking_data['blocking_rate'].append(blocking_rate)  # ✅ 记录阻塞率
 
                 tracking_data['avg_cpu_util'].append(avg_cpu_util)
                 tracking_data['avg_mem_util'].append(avg_mem_util)
@@ -564,11 +525,12 @@ def main_improved():
                 logger.info(f"总步数: {stepCount}, Epsilon: {low_level_agent.controllerEpsilon:.4f}")
                 logger.info(f"回合奖励: {episode_reward:.3f}, 回合步数: {episode_steps}")
 
-                # ----------------------------------------------------
-                # ✅ 修复: (补丁 C) 打印两个新指标
-                # ----------------------------------------------------
                 logger.info(
                     f"当前接受率(完整请求): {req_accept_rate:.2f}% ({env.total_requests_accepted}/{env.total_requests_seen})")
+                # ✅ 打印阻塞率
+                logger.info(
+                    f"当前阻塞率: {blocking_rate:.2f}% ({blocked_requests}/{env.total_requests_seen})")
+
                 logger.info(
                     f"当前接受率(按目的地): {dest_accept_rate:.2f}% ({env.total_dest_accepted}/{env.total_dest_seen})")
                 logger.info(
