@@ -141,21 +141,21 @@ class Agent_SFC:
             return action
 
     # ---------------------------
-    # Intrinsic reward (criticize)
+    # 已修改为单独的文件reward_critic_enhanced
     # ---------------------------
-    def criticize(self, sub_task_completed: bool, cost: float, request_failed: bool):
-        """
-        Compute intrinsic reward for a low-level step.
-        Assumes cost is already normalized to ~[0,1].
-        """
-        reward = 0.0
-        if sub_task_completed:
-            reward += 1.0
-        # penalize cost
-        reward -= float(cost)
-        if request_failed:
-            reward -= 5.0
-        return float(np.clip(reward, -10.0, 1.0))
+    # def criticize(self, sub_task_completed: bool, cost: float, request_failed: bool):
+    #     """
+    #     Compute intrinsic reward for a low-level step.
+    #     Assumes cost is already normalized to ~[0,1].
+    #     """
+    #     reward = 0.0
+    #     if sub_task_completed:
+    #         reward += 3.0
+    #     # penalize cost
+    #     reward -= float(cost)
+    #     if request_failed:
+    #         reward -= 5.0
+    #     return float(np.clip(reward, -10.0, 1.0))
 
     # ---------------------------
     # Store experience into PER

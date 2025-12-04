@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# @File    : hirl_sfc_env.py - FIXED VERSION
-
+# @File    : hirl_sfc_env.py - FIXED & INTEGRATED VERSION (AttributeError Fix)
+from reward_critic_enhanced import RewardCritic
+import os
 import logging
 import random
 import numpy as np
 import scipy.io as sio
 from pathlib import Path
 from typing import Dict, List, Tuple, Set, Optional, Any
+import pickle
 
 import gym
 from gym import spaces
+
+from failure_visualizer import FailureVisualizer
+
+from vnf_metrics_logger import VNFMetricsLogger  # [新增] 导入 Logger
+# [新增] 导入备份系统
+from sfc_backup_system import BackupPolicy
 
 # ----------------------------------------------------
 # Import Expert Modules
@@ -21,9 +29,8 @@ except ImportError:
     class MSFCE_Solver:
         pass
 
-
     def parse_mat_request(x):
-        return {}
+        return x
 
 # ----------------------------------------------------
 # Logging
@@ -71,31 +78,46 @@ class PathManager:
 
 
 # ----------------------------------------------------
-# SFC_HIRL_Env (Fixed & Optimized)
+# SFC_HIRL_Env (Fixed & Optimized & Integrated)
 # ----------------------------------------------------
 class SFC_HIRL_Env(gym.Env):
     """
-    分层 SFC 环境（修复版）：
-    ✅ 修复 _calc_eval 返回值解包
-    ✅ 修复 shortest_dist 依赖
-    ✅ 修复 _greedy_backup_plan 实现
-    ✅ 优化 Fallback 策略
+    分层 SFC 环境（集成 BackupPolicy 版）：
+    ✅ 集成 sfc_backup_system 实现高鲁棒性兜底
+    ✅ 修复资源状态类型兼容性
+    ✅ 修复 AttributeError: set_tree -> set_current_tree
     """
 
     def __init__(self, input_dir: Path, topo: np.ndarray, dc_nodes: List[int], capacities: Dict):
         super(SFC_HIRL_Env, self).__init__()
 
-        # 初始化专家系统
+        # =========================================================
+        # 1. 基础配置与路径 (Config & Paths)
+        # =========================================================
+        # [新增] 配置你的输出路径 (使用 raw string 防止转义)
+        self.failure_output_dir = r"E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\out_failue"
+
+        # 自动创建文件夹
+        import os
+        os.makedirs(self.failure_output_dir, exist_ok=True)
+
+        # [新增] 渲染开关
+        self.enable_render = True
+
+        # =========================================================
+        # 2. 初始化专家系统 (Expert System) - 获取网络维度
+        # =========================================================
+        # 必须最先初始化，因为它决定了 self.n (节点数) 和 self.L (链路数)
         self.expert = MSFCE_Solver(input_dir / "US_Backbone_path.mat", topo, dc_nodes, capacities)
 
         self.T = 400
         self.n, self.L, self.K_vnf = self.expert.node_num, self.expert.link_num, self.expert.type_num
         self.K_path = self.expert.k_path_count
 
-        # ✅ 修复1: 从 PathDB 构建最短距离矩阵
-        self._build_shortest_dist_matrix()
-
-        # 资源状态
+        # =========================================================
+        # 3. 资源状态初始化 (Resource State)
+        # =========================================================
+        # 必须在 Logger 之前初始化，因为 Logger 需要读取这些容量值
         self.B_cap = capacities['bandwidth']
         self.C_cap = capacities['cpu']
         self.M_cap = capacities['memory']
@@ -106,44 +128,130 @@ class SFC_HIRL_Env(gym.Env):
         self.hvt_all = np.zeros((self.n, self.K_vnf), dtype=int)
         self.link_ref_count = np.zeros(self.L, dtype=int)
 
-        # 缓存与随机性
+        # =========================================================
+        # 4. 初始化 VNFMetricsLogger (Logger)
+        # =========================================================
+        # [新增] 计算网络总资源用于 Logger 初始化
+        # 防御性判断：处理 numpy array 或 标量
+        total_cpu = np.sum(self.C_cap) if isinstance(self.C_cap, (np.ndarray, list)) else self.n * self.C_cap
+        total_bw = np.sum(self.B_cap) if isinstance(self.B_cap, (np.ndarray, list)) else self.L * self.B_cap
+        total_mem = np.sum(self.M_cap) if isinstance(self.M_cap, (np.ndarray, list)) else self.n * self.M_cap
+
+        network_info = {
+            "total_nodes": self.n,
+            "total_cpu": float(total_cpu),
+            "total_bw": float(total_bw),
+            "total_mem": float(total_mem)
+        }
+        self.metrics_logger = VNFMetricsLogger(network_info)
+
+        # =========================================================
+        # 5. 初始化可视化器 (Visualizer)
+        # =========================================================
+        # [新增] 将邻接矩阵 topo 转换为边列表
+        rows, cols = np.where(topo > 0)
+        edges = list(zip(rows.tolist(), cols.tolist()))
+
+        # 实例化，无坐标数据传 None 让其自动布局
+        self.visualizer = FailureVisualizer(topo_edges=edges, node_positions=None)
+
+        # =========================================================
+        # 6. 统计计数器 (Statistics)
+        # =========================================================
+        # [新增] 详细统计计数器 (用于计算成功率)
+        self.stats_req_total = 0  # 总请求数
+        self.stats_req_perfect = 0  # 完全成功的请求数
+        self.stats_sub_total = 0  # 总子任务数
+        self.stats_sub_success = 0  # 成功的子任务数
+
+        self.stats_total_subtasks = 0  # 兼容旧代码计数器
+        self.stats_backup_activated = 0  # 备份触发次数
+        self.stats_backup_succeeded = 0  # 备份成功次数
+
+        self.total_requests_seen = 0
+        self.total_requests_accepted = 0
+        self.total_dest_seen = 0
+        self.total_dest_accepted = 0
+
+        # =========================================================
+        # 7. 策略组件初始化 (Policy Components)
+        # =========================================================
+        # [新增] 初始化奖励函数
+        self.reward_critic = RewardCritic(training_phase=1, epoch=0, max_epochs=1200)
+
+        # [新增] 初始化备份策略系统
+        self.backup_metrics = {"activation_count": 0, "success_count": 0, "total": 0}
+        self.backup_policy = BackupPolicy(
+            expert=self.expert,
+            n=self.n,
+            L=self.L,
+            K_vnf=self.K_vnf,
+            dc_nodes=dc_nodes
+        )
+        logger.info("BackupPolicy system initialized.")
+
+        # ✅ 修复: 从 PathDB 构建最短距离矩阵
+        self._build_shortest_dist_matrix()
+
+        # =========================================================
+        # 8. 数据加载 (Data Loading)
+        # =========================================================
         self._eval_cache = {}
         self.expert_randomness = 0.1
 
-        # 加载数据
         try:
-            reqs = sio.loadmat(input_dir / "sorted_requests.mat")['sorted_requests']
-            self.requests = [parse_mat_request(r) for r in reqs]
+            # 加载请求数据
+            req_path = input_dir / "sorted_requests.pkl"
+            if not req_path.exists():
+                raise FileNotFoundError(f"找不到请求文件: {req_path}")
+
+            with open(req_path, 'rb') as f:
+                self.requests = pickle.load(f)
             self.req_map = {r['id']: r for r in self.requests}
 
-            events_mat = sio.loadmat(input_dir / "event_list.mat")['event_list']
+            # 加载事件数据
+            event_path = input_dir / "event_list.pkl"
+            if not event_path.exists():
+                raise FileNotFoundError(f"找不到事件文件: {event_path}")
+
+            with open(event_path, 'rb') as f:
+                raw_events = pickle.load(f)
+
             self.events = []
-            for t_idx in range(events_mat.shape[0]):
+            for evt in raw_events:
+                arrive_data = evt.get('arrive_event', evt.get('arrive', []))
+                leave_data = evt.get('leave_event', evt.get('leave', []))
                 self.events.append({
-                    'arrive': events_mat[t_idx, 0]['arrive_event'].flatten().astype(int),
-                    'leave': events_mat[t_idx, 0]['leave_event'].flatten().astype(int)
+                    'arrive': np.array(arrive_data, dtype=int).flatten(),
+                    'leave': np.array(leave_data, dtype=int).flatten()
                 })
+            logger.info(f"成功加载数据: {len(self.requests)} 请求, {len(self.events)} 时间步")
+
         except Exception as e:
             logger.error(f"加载数据失败: {e}")
             raise
 
-        # HIRL 状态
+        # =========================================================
+        # 9. 状态与空间定义 (State & Spaces)
+        # =========================================================
+        # HIRL 运行状态
         self.t = 0
         self.current_request: Optional[Dict] = None
         self.unadded_dest_indices: Set[int] = set()
         self.current_tree: Optional[Dict] = None
         self.nodes_on_tree: Set[int] = set()
         self.served_requests: List[Tuple[Dict, Dict]] = []
-
-        # 动作空间
-        self.NB_HIGH_LEVEL_GOALS = 10
-        self.MAX_PATHS_IN_TREE = 10
-        self.NB_LOW_LEVEL_ACTIONS = self.MAX_PATHS_IN_TREE * self.K_path
+        self.current_req_is_perfect = True  # 标记位
 
         # PathManager
+        self.MAX_PATHS_IN_TREE = 10
         self.path_manager = PathManager(max_paths=self.MAX_PATHS_IN_TREE)
 
-        # State dimensions
+        # 动作空间配置
+        self.NB_HIGH_LEVEL_GOALS = 10
+        self.NB_LOW_LEVEL_ACTIONS = self.MAX_PATHS_IN_TREE * self.K_path
+
+        # 状态空间维度
         self.dim_network = self.n + self.n + self.L + self.n * self.K_vnf
         self.dim_request = 10
         self.STATE_VECTOR_SIZE = self.dim_network + self.dim_request
@@ -152,14 +260,25 @@ class SFC_HIRL_Env(gym.Env):
         self.action_space = spaces.Discrete(self.NB_HIGH_LEVEL_GOALS)
         self.observation_space = spaces.Box(low=0.0, high=1.0,
                                             shape=(self.STATE_VECTOR_SIZE,), dtype=np.float32)
+    # [新增] 获取备份统计指标的方法
+    def get_backup_metrics(self) -> Dict[str, float]:
+        """计算并返回备份策略的触发率和成功率"""
+        total = max(1, self.stats_total_subtasks)
+        activated = self.stats_backup_activated
 
-        # Metrics
-        self.total_requests_seen = 0
-        self.total_requests_accepted = 0
-        self.total_dest_seen = 0
-        self.total_dest_accepted = 0
+        # 触发率 = 备份次数 / 总任务数
+        activation_rate = (activated / total) * 100.0
 
-    # ✅ 修复1: 构建最短距离矩阵
+        # 成功率 = 备份成功次数 / 备份触发次数
+        # (分母用 max(1, activated) 防止除零)
+        success_rate = 0.0
+        if activated > 0:
+            success_rate = (self.stats_backup_succeeded / activated) * 100.0
+
+        return {
+            'activation_rate': activation_rate,
+            'success_rate': success_rate
+        }
     def _build_shortest_dist_matrix(self):
         """从 PathDB 构建最短距离矩阵"""
         self.shortest_dist = np.full((self.n, self.n), 9999.0)
@@ -176,7 +295,6 @@ class SFC_HIRL_Env(gym.Env):
                         continue
                     try:
                         cell = self.expert.path_db[i, j]
-                        # 获取第一条路径的距离（通常是最短的）
                         dist = float(cell['pathsdistance'][0][0])
                         self.shortest_dist[i, j] = dist
                     except:
@@ -255,25 +373,18 @@ class SFC_HIRL_Env(gym.Env):
         for req, tree in self.served_requests:
             if req['id'] in leave_set:
                 bw_to_return = float(req.get('bw_origin', 0.0))
-                # 遍历树上的每条链路 —— 先 decrement, 当计数变为0时才归还带宽
+                # 遍历树上的每条链路
                 for link_idx in np.where(tree['tree'] > 0)[0]:
-                    # 防御性：若计数为0但我们需要释放，记录警告并尝试修正
                     if self.link_ref_count[link_idx] <= 0:
-                        # 说明可能存在之前的重复释放或计数不同步
-                        logger.warning(
-                            f"link_ref_count for link {link_idx} is non-positive ({self.link_ref_count[link_idx]}) when processing leave for req {req['id']}. Correcting to 0 before decrement.")
-                        # guard: set to 0 (so decrement does not go negative)
                         self.link_ref_count[link_idx] = 0
 
-                    # 先减引用
                     if self.link_ref_count[link_idx] > 0:
                         self.link_ref_count[link_idx] -= 1
 
-                    # 只有当引用计数下降至 0 时，才把带宽归还
                     if self.link_ref_count[link_idx] == 0:
-                        # add back, 并 clamp 在 [0, B_cap]
                         self.B[link_idx] = min(self.B_cap, self.B[link_idx] + bw_to_return)
-                # 节点资源释放（保持原逻辑，但也做防御性检查）
+
+                # 节点资源释放
                 for node, vnf_t in np.argwhere(tree['hvt'] > 0):
                     if self.hvt_all[node, vnf_t] > 0:
                         self.hvt_all[node, vnf_t] -= 1
@@ -321,9 +432,37 @@ class SFC_HIRL_Env(gym.Env):
         }
         self.nodes_on_tree = set([self.current_request['source']])
         self.path_manager.reset()
-        return self.current_request, self._get_flat_state()
 
-    # ✅ 修复2: 优化 Fallback 策略
+        # [修改] 调用正确的 BackupPolicy 接口 (set_tree -> set_current_tree)
+        if self.current_request:
+            self.backup_policy.set_current_request(self.current_request)
+            self.backup_policy.set_current_tree(list(self.nodes_on_tree)) # 只传节点列表，不传{}
+            # -----------------------------------------------------------
+            # [新增] 2. 开始记录当前请求
+            # -----------------------------------------------------------
+            # 提取 VNF 链名称 (示例转换，如果你的 vnf 是数字列表)
+            vnf_chain_str = [f"VNF_{v}" for v in self.current_request.get('vnf', [])]
+
+            self.metrics_logger.start_deployment(
+                request_id=f"REQ_{self.current_request['id']}",
+                vnf_chain=vnf_chain_str,
+                destinations=self.current_request.get('dest', [])
+            )
+        # -----------------------------------------------------------
+        # -----------------------------------------------------------
+        # [新增] 2. 开始记录当前请求
+        # -----------------------------------------------------------
+        # [修改] 调用 logger 时传入 t=self.t
+        if hasattr(self, 'metrics_logger'):
+            vnf_chain_str = [f"VNF_{v}" for v in self.current_request.get('vnf', [])]
+            self.metrics_logger.start_deployment(
+                request_id=f"REQ_{self.current_request['id']}",
+                vnf_chain=vnf_chain_str,
+                destinations=self.current_request.get('dest', []),
+                t=self.t  # <--- [新增] 必须加这一行，用于时间轴画图
+            )
+
+        return self.current_request, self._get_flat_state()
     def get_expert_high_level_candidates(self, state_vec: np.ndarray, top_k: int = 5) -> List[Tuple[int, float]]:
         if not self.current_request or not self.unadded_dest_indices:
             return []
@@ -343,7 +482,6 @@ class SFC_HIRL_Env(gym.Env):
                         eval_val = self._eval_cache[cache_key]
                     else:
                         try:
-                            # ✅ 正确解包 8 个返回值
                             eval_val, _, _, _, feasible, _, _, _ = self.expert._calc_eval(
                                 self.current_request, d_idx, k, network_state
                             )
@@ -376,32 +514,29 @@ class SFC_HIRL_Env(gym.Env):
                 if best_eval > -np.inf:
                     candidates.append((d_idx, float(best_eval)))
 
-        # ✅ 智能 Fallback: 使用最短距离
+        # Fallback: 使用最短距离
         if not candidates:
             fallback_cands = []
-            source_node = self.current_request['source'] - 1  # 转换为 0-based
+            source_node = self.current_request['source'] - 1
             dest_nodes = self.current_request['dest']
 
             for d_idx in self.unadded_dest_indices:
                 try:
-                    target_node = dest_nodes[d_idx] - 1  # 转换为 0-based
+                    target_node = dest_nodes[d_idx] - 1
                     if 0 <= source_node < self.n and 0 <= target_node < self.n:
                         dist = float(self.shortest_dist[source_node, target_node])
                     else:
                         dist = 9999.0
                 except:
                     dist = 9999.0
-                # 距离越小越好，score = -dist
                 fallback_cands.append((d_idx, -dist))
 
             fallback_cands.sort(key=lambda x: x[1], reverse=True)
             candidates = fallback_cands
             logger.debug(f"Using fallback strategy for request {req_id}")
 
-        # 排序
         candidates_sorted = sorted(candidates, key=lambda x: x[1], reverse=True)
 
-        # Expert Randomness
         if len(candidates_sorted) >= 2 and random.random() < self.expert_randomness:
             candidates_sorted[0], candidates_sorted[1] = candidates_sorted[1], candidates_sorted[0]
 
@@ -471,70 +606,52 @@ class SFC_HIRL_Env(gym.Env):
         i_idx = i_idx % min(num_paths, self.MAX_PATHS_IN_TREE)
         return i_idx, k_idx
 
-    # ✅ 修复3: 实现真正的 Greedy Backup Plan
-    def _greedy_backup_plan(self, goal_dest_idx: int, network_state: Dict) -> Optional[Dict]:
+    def step_low_level(self, goal_dest_idx: int, low_level_action):
         """
-        简化的 Greedy Backup: 尝试使用 PathDB 的第一条路径（通常是最短的）
+        增强版 step_low_level (All-in-One Integrated)：
+        - 核心逻辑：Expert → Backup → Deployment
+        - 智能奖励：RewardCritic
+        - 数据埋点：自动记录每一步的资源消耗、路径、失败原因到 VNFMetricsLogger
+        - 视觉诊断：仅在出现“部分失败”（Partial Failure）时自动保存可视化图像
+        - 全局统计：更新完全/部分成功率计数器
         """
-        try:
-            if not self.current_tree['paths_map']:
-                src = self.current_request['source']
-            else:
-                # 从源节点出发（简化策略）
-                src = self.current_request['source']
-
-            dst = self.current_request['dest'][goal_dest_idx]
-
-            # 尝试获取第一条路径（k=1）
-            nodes, dist, links = self.expert._get_path_info(src, dst, 1)
-
-            if not nodes:
-                logger.debug(f"Backup failed: No path from {src} to {dst}")
-                return None
-
-            # 构建简化的 plan（不检查资源，让 apply 时处理）
-            tree_vec = np.zeros(self.L)
-            for lid in links:
-                if lid - 1 < len(tree_vec):
-                    tree_vec[lid - 1] = 1
-
-            # 不部署 VNF（简化版），仅返回路径
-            return {
-                'tree': tree_vec,
-                'hvt': np.zeros((self.n, self.K_vnf)),
-                'new_path_full': nodes,
-                'feasible': True,
-                'placement': {}
-            }
-        except Exception as e:
-            logger.debug(f"Greedy backup failed: {e}")
-            return None
-
-    # ✅ 修复4: 修正 step_low_level
-    def step_low_level(self, goal_dest_idx: int, low_level_action) -> Tuple[np.ndarray, float, bool, bool]:
         self._clear_cache()
 
+        # ---- 解码行动 ----
         if isinstance(low_level_action, tuple) and len(low_level_action) == 3:
             i_idx, k_idx, placement = low_level_action
         else:
             i_idx, k_idx = self._decode_low_level_action(int(low_level_action))
             placement = {}
 
+        # [统计] 增加子任务计数 (用于计算部分成功率)
+        self.stats_total_subtasks += 1  # 原有计数器
+        self.stats_sub_total += 1  # 新增计数器 (Success Rate 计算用)
+
         k = k_idx + 1
 
+        # ---- 无效请求：直接结束 ----
         if self.current_request is None or goal_dest_idx not in self.unadded_dest_indices:
             done = not (self.unadded_dest_indices and self.current_request)
             return self._get_flat_state(), 0.0, True, done
 
+        # ---- 网络状态准备 ----
         network_state = self._get_network_state_dict()
         network_state['request'] = self.current_request
-        plan = None
-        feasible = False
 
-        # Expert Calculation
+        # ---- 执行过程变量初始化 ----
+        feasible = False
+        plan = None
+        backup_used = False
+        backup_level = "primary"
+        failure_reason = None
+
+        # ===============================
+        # 1) 尝试 Expert 计算
+        # ===============================
         try:
             if not self.current_tree['paths_map']:
-                # ✅ 正确解包 8 个返回值
+                # 直接构造第一条路径
                 eval_val, paths, tree, hvt, feasible, _, _, placement_expert = \
                     self.expert._calc_eval(self.current_request, goal_dest_idx, k, network_state)
 
@@ -546,6 +663,7 @@ class SFC_HIRL_Env(gym.Env):
                         'feasible': True,
                         'placement': placement_expert
                     }
+
             else:
                 conn_path = self._get_path_for_i_idx(i_idx)
                 plan, eval_val, action, _ = self.expert._calc_atnp(
@@ -554,25 +672,48 @@ class SFC_HIRL_Env(gym.Env):
                 feasible = plan.get('feasible', False) if isinstance(plan, dict) else False
 
         except Exception as e:
-            logger.warning(f"Expert calculation failed for goal {goal_dest_idx}: {e}")
+            logger.warning(f"[Expert Error] goal={goal_dest_idx}, err={e}")
             feasible = False
+            failure_reason = "invalid_action"
 
-        # Env-level Backup
+        # ===============================
+        # 2) Expert 失败 → BackupPolicy
+        # ===============================
         if not feasible:
-            plan = self._greedy_backup_plan(goal_dest_idx, network_state)
-            if plan:
-                feasible = True
-                logger.debug(f"Using greedy backup for goal {goal_dest_idx}")
+            backup_used = True
+            self.stats_backup_activated += 1
 
-        # 部署或惩罚
+            # 将 numpy 数组资源转成 dict（BackupPolicy 需要）
+            backup_net_state = network_state.copy()
+            backup_net_state['cpu'] = {i: float(self.C[i]) for i in range(len(self.C))}
+            backup_net_state['mem'] = {i: float(self.M[i]) for i in range(len(self.M))}
+
+            self.backup_policy.set_current_tree(list(self.nodes_on_tree))
+            plan = self.backup_policy.get_backup_plan(goal_dest_idx, backup_net_state)
+
+            if plan and plan.get('feasible'):
+                feasible = True
+                self.stats_backup_succeeded += 1
+                backup_level = plan.get("backup_type", "unknown")
+            else:
+                failure_reason = failure_reason or "resource_exhausted"
+
+        # ===============================
+        # 3) 部署或失败处理
+        # ===============================
         if feasible and plan is not None:
+            # ---- 部署成功 ----
             self._apply_deployment(self.current_request, plan)
+
+            # [统计] 子任务成功数 +1
+            self.stats_sub_success += 1
+
             if goal_dest_idx in self.unadded_dest_indices:
                 self.unadded_dest_indices.remove(goal_dest_idx)
 
+            # 记录路径
             dest_list = self.current_request.get('dest', [])
             dest_node = dest_list[goal_dest_idx] if goal_dest_idx < len(dest_list) else None
-            self.total_dest_accepted += 1
 
             new_path = plan.get('new_path_full', [])
             if new_path:
@@ -583,22 +724,175 @@ class SFC_HIRL_Env(gym.Env):
 
             sub_task_done = True
 
-            # Reward Shaping: 惩罚路径长度
+            # 计算基础 Cost
             path_len = len(new_path) if new_path else 1.0
             cost_val = 0.1 * (path_len / 10.0)
 
-            # 请求完成
+            # 若所有目的节点都完成
             if not self.unadded_dest_indices:
                 if (self.current_request, self.current_tree) not in self.served_requests:
                     self.served_requests.append((self.current_request, self.current_tree))
                 self.total_requests_accepted += 1
-        else:
-            cost_val = 5.0  # 失败大惩罚
-            sub_task_done = False
-            logger.debug(f"Plan infeasible for goal {goal_dest_idx}")
 
+        else:
+            # ---- 完全失败 ----
+            sub_task_done = False
+            cost_val = 5.0
+            failure_reason = failure_reason or "routing_deadlock"
+
+            # [统计] 标记该请求不再是“完美”的
+            self.current_req_is_perfect = False
+
+            logger.debug(f"[Plan Failed] goal={goal_dest_idx}")
+
+            # -----------------------------
+            # [可视化] 仅在部分失败时保存图像
+            # -----------------------------
+            # 如果树中已经有路径(has_existing_paths=True)，但当前这一步失败了，说明是Partial Failure
+            has_existing_paths = len(self.current_tree.get('paths_map', {})) > 0
+            if self.enable_render and has_existing_paths:
+                self.render_failure(
+                    failed_dest_idx=goal_dest_idx,
+                    title=f"Partial Failure: Req {self.current_request['id']} (Tree Exists)"
+                )
+
+        # ===============================
+        # 4) QoS检查 + progress shaping
+        # ===============================
+        qos_viol = self._compute_qos_violation()
+        progress = self._compute_progress(goal_dest_idx)
+
+        # 整个请求是否终止
         request_done = not self.unadded_dest_indices
-        return self._get_flat_state(), float(cost_val), sub_task_done, request_done
+
+        # ===========================================================
+        # [修改] 5. 准备详细的 Logger 数据 (适配最终版 Logger)
+        # ===========================================================
+
+        # 1. 准备基础数据
+        dests = self.current_request.get('dest', [])
+        dest_node_id = dests[goal_dest_idx] if goal_dest_idx < len(dests) else -1
+
+        # 2. 构建详细的资源使用字典 (用于 Logger 去重计算)
+        vnf_placement_info = {}
+        link_usage_info = {}
+
+        step_cpu_cons = 0.0
+        step_mem_cons = 0.0
+        step_bw_cons = 0.0
+
+        if feasible and plan:
+            # --- 提取 VNF 放置信息 ---
+            # plan['placement'] 通常是 {vnf_index: node_id}
+            # 我们需要转成: {node_id: {'cpu': val, 'mem': val}}
+            req_cpus = self.current_request.get('cpu_origin', [])
+            req_mems = self.current_request.get('memory_origin', [])
+
+            # 如果有 placement 信息
+            if 'placement' in plan:
+                for v_idx, node in plan['placement'].items():
+                    # 获取该 VNF 的具体资源需求
+                    c_val = req_cpus[v_idx] if v_idx < len(req_cpus) else 0.0
+                    m_val = req_mems[v_idx] if v_idx < len(req_mems) else 0.0
+
+                    # 记录到字典 (如果同一个节点放了多个VNF，累加)
+                    if node not in vnf_placement_info:
+                        vnf_placement_info[node] = {'cpu': 0.0, 'mem': 0.0}
+                    vnf_placement_info[node]['cpu'] += float(c_val)
+                    vnf_placement_info[node]['mem'] += float(m_val)
+
+                    # 累计总消耗
+                    step_cpu_cons += c_val
+                    step_mem_cons += m_val
+
+            # --- 提取链路使用信息 ---
+            path_nodes = plan.get('new_path_full', [])
+            req_bw = float(self.current_request.get('bw_origin', 0.0))
+
+            if len(path_nodes) > 1:
+                for u, v in zip(path_nodes[:-1], path_nodes[1:]):
+                    # 确保链路 key 顺序一致，例如总是小号在前 (u, v)
+                    link_key = tuple(sorted((u, v)))
+                    link_usage_info[link_key] = {'bw': float(req_bw)}
+
+                # 累计总消耗 (跳数 * 带宽)
+                step_bw_cons = req_bw * (len(path_nodes) - 1)
+
+        # 3. 组装 step_info
+        step_info = {
+            "destination": int(dest_node_id),
+            "success": bool(feasible),
+            "path": plan.get('new_path_full', []) if feasible and plan else [],
+            "vnf_placement": vnf_placement_info,  # <--- [新增] 传入放置详情
+            "link_usage": link_usage_info,  # <--- [新增] 传入链路详情
+            "backup_used": bool(backup_used),
+            "backup_level": str(backup_level),
+            "failure_reason": str(failure_reason) if not feasible else None
+        }
+
+        # 4. 组装消耗概览 (兼容旧接口)
+        resource_consumed = {
+            "cpu": float(step_cpu_cons),
+            "bw": float(step_bw_cons),
+            "mem": float(step_mem_cons)
+        }
+
+        # 5. 获取网络状态
+        current_net_state = {
+            "available_cpu": float(np.sum(self.C)),
+            "available_bw": float(np.sum(self.B)),
+            "available_mem": float(np.sum(self.M)),
+            # 传入容量以便计算百分比
+            "node_cpu_capacity": float(self.C_cap) if not isinstance(self.C_cap, (list, np.ndarray)) else float(
+                np.mean(self.C_cap)),
+            "node_mem_capacity": float(self.M_cap) if not isinstance(self.M_cap, (list, np.ndarray)) else float(
+                np.mean(self.M_cap)),
+            "link_bw_capacity": float(self.B_cap) if not isinstance(self.B_cap, (list, np.ndarray)) else float(
+                np.mean(self.B_cap))
+        }
+
+        # D. 写入 Logger
+        if hasattr(self, 'metrics_logger'):
+            self.metrics_logger.record_step(step_info, resource_consumed, current_net_state)
+        # ===============================
+        # 6) 调用 RewardCritic (核心)
+        # ===============================
+        reward = self.reward_critic.criticize(
+            sub_task_completed=sub_task_done,
+            cost=cost_val,
+            request_failed=(request_done and not sub_task_done),
+            progress_to_goal=progress,
+            backup_used=backup_used,
+            backup_level=backup_level,
+            qos_violations=qos_viol,
+            failure_reason=failure_reason,
+            agent_action=int(low_level_action) if not isinstance(low_level_action, tuple) else -1,
+            expert_action=self.expert_low_level_action(goal_dest_idx),
+            state_novelty=self._state_novelty(),
+            expert_confidence=1.0
+        )
+
+        # ===============================
+        # [Logger] 7) 请求结束时的处理
+        # ===============================
+        if request_done:
+            # 更新统计计数器
+            self.stats_req_total += 1
+            if self.current_req_is_perfect:
+                self.stats_req_perfect += 1
+
+            # 通知 Logger 结束部署记录
+            if hasattr(self, 'metrics_logger'):
+                self.metrics_logger.end_deployment(current_net_state)
+
+                # (可选) 实时监控打印：每10个请求打印一次最近的成功率
+                if self.stats_req_total % 10 == 0:
+                    realtime_stats = self.metrics_logger.get_realtime_stats()
+                    acc = realtime_stats.get('recent_full_acceptance', 0)
+                    logger.info(f"[Metrics] Recent Full Acceptance: {acc:.2%}")
+
+        return self._get_flat_state(), float(reward), sub_task_done, request_done
+
 
     def _apply_deployment(self, request: Dict, plan: Dict):
         """应用部署方案到网络状态（带防御性检查）"""
@@ -628,3 +922,138 @@ class SFC_HIRL_Env(gym.Env):
             self.hvt_all[node, vnf_t] += 1
 
         self.current_tree['hvt'] = np.maximum(self.current_tree['hvt'], hvt_branch)
+
+    def _compute_progress(self, goal_idx):
+        """
+        计算当前状态距离目标的改善程度，范围 [-1,1]
+        """
+        try:
+            goal_node = self.current_request['dest'][goal_idx]
+            current_dist = self._shortest_distance(self.current_node, goal_node)
+            prev_dist = getattr(self, "_prev_dist", current_dist)
+            self._prev_dist = current_dist
+            progress = prev_dist - current_dist
+            return float(np.tanh(progress / 5.0))
+        except:
+            return 0.0
+
+    def _compute_qos_violation(self):
+        """
+        简易 QoS 违反检测：
+        返回形如 {"delay":0.2, "bandwidth":0.1}
+        所有值 ∈ [0,1]，表示违反比例
+        """
+        viol = {}
+
+        # ---- 延迟违反 ----
+        if hasattr(self, "current_delay") and hasattr(self, "delay_threshold"):
+            if self.current_delay > self.delay_threshold:
+                viol["delay"] = min(1.0, (self.current_delay - self.delay_threshold) / self.delay_threshold)
+
+        # ---- 带宽违反 ----
+        if hasattr(self, "current_bw_usage") and hasattr(self, "bw_threshold"):
+            if self.current_bw_usage > self.bw_threshold:
+                viol["bandwidth"] = min(1.0, (self.current_bw_usage - self.bw_threshold) / self.bw_threshold)
+
+        # ---- 丢包率违反 ----
+        if hasattr(self, "current_loss") and hasattr(self, "loss_threshold"):
+            if self.current_loss > self.loss_threshold:
+                viol["packet_loss"] = min(1.0, (self.current_loss - self.loss_threshold) / self.loss_threshold)
+
+        return viol if viol else None
+
+    def _compute_progress(self, goal_dest_idx):
+        """
+        progress ∈ [-1,1]
+        负数 = 离目标更远
+        正数 = 更接近目标
+        """
+        try:
+            dest_node = self.current_request["dest"][goal_dest_idx]
+            current_node = self.current_state_info.get("current_node", None)
+
+            if current_node is None or dest_node is None:
+                return 0.0
+
+            # 使用最短路径距离衡量进度
+            import networkx as nx
+            d_prev = nx.shortest_path_length(self.G, self.prev_node, dest_node) if hasattr(self, "prev_node") else None
+            d_now = nx.shortest_path_length(self.G, current_node, dest_node)
+
+            self.prev_node = current_node
+
+            if d_prev is None:
+                return 0.0
+
+            progress = (d_prev - d_now) / max(1, d_prev)
+            return float(np.clip(progress, -1.0, 1.0))
+
+        except:
+            return 0.0
+
+    def expert_low_level_action(self, goal_dest_idx):
+        """
+        返回专家推荐的低层动作
+        若无法获得专家动作，则返回 -1（表示跳过DAgger奖励）
+        """
+        try:
+            return self.expert_last_action  # 如果你在 expert 调用后保存
+        except:
+            return -1
+
+    def _state_novelty(self):
+        """
+        用于判断当前状态是否“新颖”
+        值越大（接近1）表示这个状态很少被访问过→鼓励探索
+        """
+        if not hasattr(self, "state_visit_counter"):
+            self.state_visit_counter = {}
+
+        s = tuple(self._get_flat_state().astype(int))
+
+        if s not in self.state_visit_counter:
+            self.state_visit_counter[s] = 0
+        self.state_visit_counter[s] += 1
+
+        # visit 越少 → 新颖度越高
+        novelty = 1.0 / np.sqrt(self.state_visit_counter[s])
+        return float(np.clip(novelty, 0.0, 1.0))
+
+    # [新增] 辅助方法：准备数据并调用画图
+    def render_failure(self, failed_dest_idx, failed_path=None, title="Failure"):
+        if not self.enable_render or not self.current_request:
+            return
+
+        # 准备数据
+        src = self.current_request['source']
+        dests = self.current_request.get('dest', [])
+        failed_node = dests[failed_dest_idx] if failed_dest_idx < len(dests) else -1
+
+        success_paths = self.current_tree.get('paths_map', {})
+
+        vnf_placement = {}
+        if self.current_tree:
+            ns, vs = np.where(self.current_tree['hvt'] > 0)
+            for n, v in zip(ns, vs):
+                vnf_placement[f"VNF_{v}"] = n
+
+        # -----------------------------
+        # [核心] 生成文件名并调用保存
+        # -----------------------------
+        # 文件名格式: fail_req{请求ID}_goal{目标索引}_node{目标节点号}.png
+        req_id = self.current_request.get('id', self.total_requests_seen)
+        filename = f"fail_req{req_id}_goal{failed_dest_idx}_node{failed_node}.png"
+
+        # 拼接完整路径
+        full_path = os.path.join(self.failure_output_dir, filename)
+
+        self.visualizer.draw_failure_case(
+            src=src,
+            dests=dests,
+            success_paths=success_paths,
+            vnf_placement=vnf_placement,
+            failed_dest=failed_node,
+            failed_path=failed_path,
+            title=title,
+            save_path=full_path  # <--- 传入路径
+        )

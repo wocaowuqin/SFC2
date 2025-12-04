@@ -61,7 +61,12 @@ class SolverConfig:
 
 
 def parse_mat_request(req_obj) -> Dict:
-    """解析 MATLAB 请求（兼容两种格式）"""
+    """解析请求（兼容 Python Dict 和 MATLAB 格式）"""
+    # 1. 如果已经是 Python 字典 (来自 .pkl)，直接返回
+    if isinstance(req_obj, dict):
+        return req_obj
+
+    # 2. 否则尝试解析 MATLAB 格式 (保留原有逻辑以防万一)
     try:
         return {
             'id': int(req_obj['id'][0, 0]),
@@ -75,6 +80,7 @@ def parse_mat_request(req_obj) -> Dict:
             'leave_time': int(req_obj.get('leave_time', [[0]])[0, 0]),
         }
     except:
+        # 旧版兼容
         return {
             'id': int(req_obj[0][0][0]),
             'source': int(req_obj[0][1][0]),
@@ -84,7 +90,31 @@ def parse_mat_request(req_obj) -> Dict:
             'memory_origin': [float(x) for x in req_obj[0][5].flatten()],
             'bw_origin': float(req_obj[0][6][0][0])
         }
-
+# def parse_mat_request(req_obj) -> Dict:
+#     """解析 MATLAB 请求（兼容两种格式）"""
+#     try:
+#         return {
+#             'id': int(req_obj['id'][0, 0]),
+#             'source': int(req_obj['source'][0, 0]),
+#             'dest': [int(d) for d in req_obj['dest'].flatten()],
+#             'vnf': [int(v) for v in req_obj['vnf'].flatten()],
+#             'bw_origin': float(req_obj['bw_origin'][0, 0]),
+#             'cpu_origin': [float(c) for c in req_obj['cpu_origin'].flatten()],
+#             'memory_origin': [float(m) for m in req_obj['memory_origin'].flatten()],
+#             'arrival_time': int(req_obj.get('arrival_time', [[0]])[0, 0]),
+#             'leave_time': int(req_obj.get('leave_time', [[0]])[0, 0]),
+#         }
+#     except:
+#         return {
+#             'id': int(req_obj[0][0][0]),
+#             'source': int(req_obj[0][1][0]),
+#             'dest': [int(x) for x in req_obj[0][2].flatten()],
+#             'vnf': [int(x) for x in req_obj[0][3].flatten()],
+#             'cpu_origin': [float(x) for x in req_obj[0][4].flatten()],
+#             'memory_origin': [float(x) for x in req_obj[0][5].flatten()],
+#             'bw_origin': float(req_obj[0][6][0][0])
+#         }
+#
 
 class MSFCE_Solver:
     """MSFC-CE 专家算法求解器（融合增强版）"""
