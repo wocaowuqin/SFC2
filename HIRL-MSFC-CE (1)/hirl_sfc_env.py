@@ -923,19 +923,84 @@ class SFC_HIRL_Env(gym.Env):
 
         self.current_tree['hvt'] = np.maximum(self.current_tree['hvt'], hvt_branch)
 
+    def _shortest_distance(self, src: int, dst: int) -> float:
+        """获取两节点间的最短距离"""
+        if src == dst:
+            return 0.0
+
+        # 使用预计算的矩阵
+        if hasattr(self, 'shortest_dist'):
+            src_idx = src - 1 if src > 0 else 0
+            dst_idx = dst - 1 if dst > 0 else 0
+            if 0 <= src_idx < self.n and 0 <= dst_idx < self.n:
+                return float(self.shortest_dist[src_idx, dst_idx])
+
+        return 9999.0
+
+    def _find_closest_tree_node_to_goal(self, goal_node: int) -> int:
+        """找到树中离目标最近的节点"""
+        if not self.nodes_on_tree:
+            return self.current_request.get('source', 1)
+
+        min_dist = float('inf')
+        closest_node = list(self.nodes_on_tree)[0]
+
+        for node in self.nodes_on_tree:
+            dist = self._shortest_distance(node, goal_node)
+            if dist < min_dist:
+                min_dist = dist
+                closest_node = node
+
+        return closest_node
     def _compute_progress(self, goal_idx):
         """
+        修复版 progress 计算
+
         计算当前状态距离目标的改善程度，范围 [-1,1]
+        - 负数 = 离目标更远
+        - 正数 = 更接近目标
+
+        使用最短路径矩阵而不是 networkx（避免依赖问题）
         """
         try:
-            goal_node = self.current_request['dest'][goal_idx]
-            current_dist = self._shortest_distance(self.current_node, goal_node)
+            if not self.current_request:
+                return 0.0
+
+            dest_list = self.current_request.get('dest', [])
+            if goal_idx >= len(dest_list):
+                return 0.0
+
+            goal_node = dest_list[goal_idx]
+
+            # 获取当前位置（树中最近添加的节点）
+            if self.nodes_on_tree:
+                # 找到树中离目标最近的节点
+                current_node = self._find_closest_tree_node_to_goal(goal_node)
+            else:
+                current_node = self.current_request.get('source', 1)
+
+            # 使用预计算的最短路径矩阵
+            current_dist = self._shortest_distance(current_node, goal_node)
+
+            # 获取上一步的距离
             prev_dist = getattr(self, "_prev_dist", current_dist)
             self._prev_dist = current_dist
-            progress = prev_dist - current_dist
-            return float(np.tanh(progress / 5.0))
-        except:
-            return 0.0
+
+            # 如果第一次调用，返回0
+            if prev_dist == current_dist and not hasattr(self, "_progress_initialized"):
+                self._progress_initialized = True
+                return 0.0
+
+            # 计算进度
+            if prev_dist == 0:
+                return 1.0 if current_dist == 0 else -1.0
+
+            progress = (prev_dist - current_dist) / max(1, prev_dist)
+            return float(np.clip(progress, -1.0, 1.0))
+
+        except Exception as e:
+            logger.debug(f"[_compute_progress] Error: {e}")
+            return 0
 
     def _compute_qos_violation(self):
         """

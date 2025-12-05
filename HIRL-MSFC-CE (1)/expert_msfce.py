@@ -36,17 +36,17 @@ logger = logging.getLogger(__name__)
 # ========== 配置类（来自 Document 4）==========
 @dataclass
 class SolverConfig:
-    """集中式配置管理"""
+    """集中式配置管理 - 修复版"""
     alpha: float = 0.3
     beta: float = 0.3
     gamma: float = 0.4
-    candidate_set_size: int = 4
-    lookahead_depth: int = 3
+    candidate_set_size: int = 8  # 🔥 从4改为8
+    lookahead_depth: int = 1  # 🔥 从3改为1 (关键!)
     k_path: int = 5
     max_cache_size: int = 5000
-    max_iterations: int = 200
-    max_time_seconds: float = 20.0
-    max_candidates: int = 12
+    max_iterations: int = 500  # 🔥 从200改为500
+    max_time_seconds: float = 60.0  # 🔥 从20改为60
+    max_candidates: int = 30  # 🔥 从12改为30
     otv_link_weight: float = 0.2
     otv_node_weight: float = 0.8
     otv_norm_link: float = 90.0
@@ -90,6 +90,8 @@ def parse_mat_request(req_obj) -> Dict:
             'memory_origin': [float(x) for x in req_obj[0][5].flatten()],
             'bw_origin': float(req_obj[0][6][0][0])
         }
+
+
 # def parse_mat_request(req_obj) -> Dict:
 #     """解析 MATLAB 请求（兼容两种格式）"""
 #     try:
@@ -170,6 +172,79 @@ class MSFCE_Solver:
             'errors': 0,
         }
 
+        # ========== 🔍 初始化诊断 START ==========
+        logger.info("=" * 60)
+        logger.info("DIAGNOSTIC: Expert MSFCE Initialization")
+        logger.info("=" * 60)
+
+        # 1. 基本配置
+        logger.info(f"✓ Node count: {self.node_num}")
+        logger.info(f"✓ Link count: {self.link_num}")
+        logger.info(f"✓ Type count: {self.type_num}")
+        logger.info(f"✓ K-path: {self.k_path}")
+
+        # 2. DC节点检查
+        logger.info(f"✓ DC count: {len(self.DC)}")
+        if len(self.DC) == 0:
+            logger.error("✗ ERROR: DC list is EMPTY! This will cause 100% blocking!")
+            logger.error("  Fix: Ensure dc_nodes parameter is passed correctly")
+        else:
+            dc_sorted = sorted(list(self.DC))
+            logger.info(f"✓ DC nodes (first 10): {dc_sorted[:10]}")
+            logger.info(f"  DC range: [{min(dc_sorted)}, {max(dc_sorted)}]")
+
+        # 3. 资源容量
+        logger.info(f"✓ Capacities: CPU={self.cap_cpu}, MEM={self.cap_mem}, BW={self.cap_bw}")
+
+        # 4. 配置参数
+        logger.info(f"✓ Config: lookahead_depth={self.config.lookahead_depth}, "
+                    f"max_candidates={self.config.max_candidates}, "
+                    f"candidate_set_size={self.config.candidate_set_size}")
+
+        # 5. 路径数据库检查
+        if self.path_db is None:
+            logger.error("✗ ERROR: Path DB is None!")
+        else:
+            logger.info(f"✓ Path DB shape: {self.path_db.shape}")
+
+            # 测试路径查询
+            if len(self.DC) >= 2:
+                dc_list = sorted(list(self.DC))
+                test_src, test_dst = dc_list[0], dc_list[1]
+
+                logger.info(f"Testing path query: {test_src} -> {test_dst}")
+
+                try:
+                    nodes, dist, links = self._get_path_info(test_src, test_dst, 1)
+
+                    if nodes:
+                        logger.info(f"  ✓ SUCCESS: Found {len(nodes)} nodes")
+                        logger.info(f"    Path nodes: {nodes}")
+
+                        # 检查DC覆盖
+                        dcs_on_path = [n for n in nodes if n in self.DC]
+                        logger.info(f"    DCs on path: {dcs_on_path} ({len(dcs_on_path)} DCs)")
+
+                        if len(dcs_on_path) == 0:
+                            logger.error("  ✗ ERROR: No DCs on path! Index mismatch?")
+                            logger.error(f"    Path nodes range: [{min(nodes)}, {max(nodes)}]")
+                            logger.error(f"    DC nodes range: [{min(dc_sorted)}, {max(dc_sorted)}]")
+                    else:
+                        logger.error("  ✗ ERROR: NO PATH FOUND!")
+                        logger.error("    This is likely the root cause of low acceptance rate")
+                        logger.error("    Possible issues:")
+                        logger.error("      1. Path DB format incompatibility")
+                        logger.error("      2. Index confusion (0-based vs 1-based)")
+                        logger.error("      3. Missing path data filtering")
+
+                except Exception as e:
+                    logger.error(f"  ✗ EXCEPTION during path test: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+        logger.info("=" * 60)
+        # ========== 🔍 初始化诊断 END ==========
+
     def _create_link_map(self, topo: np.ndarray) -> Tuple[int, Dict]:
         """构建链路映射"""
         link_map = {}
@@ -198,31 +273,98 @@ class MSFCE_Solver:
             normalized['request'] = state['request']
         return normalized
 
-    # ========== 核心方法：路径查询（修复自环）==========
+    # ========== 核心方法：路径查询（修复版）==========
     def _get_path_info(self, src: int, dst: int, k: int):
         """
         获取路径信息（1-based 索引）
-        ✅ 修复：处理 src==dst 自环情况
+        🔥 修复版：添加负值过滤和dist_k截断
         """
         if self.path_db is None:
             return [], 0, []
 
-        # ✅ 自环处理
+        # 自环处理
         if src == dst:
             return [src], 0, []
 
+        # 索引范围检查
+        if src < 1 or src > self.node_num or dst < 1 or dst > self.node_num:
+            logger.warning(f"[PATH] Invalid nodes: src={src}, dst={dst}, valid=[1,{self.node_num}]")
+            return [], 0, []
+
         try:
-            cell = self.path_db[src - 1, dst - 1]
-            dist = int(cell['pathsdistance'][k - 1][0])
-            nodes = cell['paths'][k - 1, :dist + 1].astype(int).tolist()
+            # 访问路径数据 (转为0-based索引)
+            pinfo = self.path_db[src - 1, dst - 1]
+
+            # 检查paths字段
+            if 'paths' not in pinfo.dtype.names:
+                logger.debug(f"[PATH] No 'paths' field for [{src}->{dst}]")
+                return [], 0, []
+
+            raw_paths = pinfo['paths']
+
+            if raw_paths.size == 0:
+                logger.debug(f"[PATH] Empty paths for [{src}->{dst}]")
+                return [], 0, []
+
+            # 获取第k条路径
+            idx = k - 1
+            path_arr = None
+
+            # 处理不同的数据结构
+            if raw_paths.dtype == 'O':  # 对象数组
+                flat_data = raw_paths.flatten()
+                if idx < len(flat_data):
+                    path_arr = flat_data[idx]
+            elif raw_paths.ndim == 2:  # 二维数组
+                if idx < raw_paths.shape[0]:
+                    path_arr = raw_paths[idx]
+            elif raw_paths.ndim == 1 and idx == 0:  # 一维数组
+                path_arr = raw_paths
+
+            if path_arr is None:
+                return [], 0, []
+
+            # 🔥 修复1: 获取distance信息
+            dist_k = 0
+            if 'pathsdistance' in pinfo.dtype.names:
+                raw_dists = pinfo['pathsdistance'].flatten()
+                if idx < len(raw_dists):
+                    dist_k = int(raw_dists[idx])
+
+            # 🔥 修复2: 转换为列表并过滤负值 (参考calc_eval1.py)
+            path_arr_flat = np.array(path_arr).flatten()
+
+            # 先截取到dist_k+1长度
+            if dist_k > 0:
+                path_segment = path_arr_flat[:dist_k + 1]
+            else:
+                path_segment = path_arr_flat
+
+            # 🔥 关键修复: 过滤负值和0 (MATLAB填充值)
+            path_nodes = [int(x) for x in path_segment if int(x) > 0]
+
+            if len(path_nodes) == 0:
+                logger.debug(f"[PATH] All nodes filtered for [{src}->{dst}], k={k}")
+                return [], 0, []
+
+            # 🔥 完全忽略 link_ids 字段，从节点重新计算
+            # 原因：路径数据库中的 link_ids 值超出实际链路数量
             links = []
-            for i in range(len(nodes) - 1):
-                u, v = nodes[i], nodes[i + 1]
-                if (u, v) in self.link_map:
-                    links.append(self.link_map[(u, v)])
-            return nodes, dist, links
-        except (IndexError, KeyError) as e:
-            logger.warning(f"Path lookup failed {src}->{dst} k={k}: {e}")
+            if len(path_nodes) > 1:
+                for i in range(len(path_nodes) - 1):
+                    u, v = path_nodes[i], path_nodes[i + 1]
+                    if (u, v) in self.link_map:
+                        links.append(self.link_map[(u, v)])
+                    elif (v, u) in self.link_map:
+                        # 尝试反向（双向链路）
+                        links.append(self.link_map[(v, u)])
+                    else:
+                        logger.debug(f"[PATH] No link for edge ({u},{v})")
+
+            return path_nodes, len(path_nodes) - 1 if len(path_nodes) > 1 else 0, links
+
+        except Exception as e:
+            logger.warning(f"[PATH] Exception for [{src}->{dst}], k={k}: {e}")
             return [], 0, []
 
     def _get_max_hops(self, src: int, dst: int) -> int:
@@ -561,6 +703,7 @@ class MSFCE_Solver:
             return best_res, best_eval, best_action, cost
         else:
             return {'feasible': False}, 0.0, (0, 0), 0.0
+
     # ========== 资源预检查 ==========
     def _check_resource_feasibility(self, request: Dict, state: Dict) -> bool:
         """快速全局资源检查"""
@@ -711,7 +854,7 @@ class MSFCE_Solver:
                 while subsequent_count < current_lookahead_depth and remaining_after:
                     next_candidates = []
                     current_sim_paths = list(temp_tree_sim['paths_map'].values()) \
-                                       if temp_tree_sim['paths_map'] else [[request['source']]]
+                        if temp_tree_sim['paths_map'] else [[request['source']]]
 
                     for next_d_idx in remaining_after:
                         for path in current_sim_paths:
@@ -760,7 +903,7 @@ class MSFCE_Solver:
 
                 if not applied:
                     self._record_failure(request.get('id', '?'),
-                                       {'type': 'apply_failed', 'info': 'final apply failed'})
+                                         {'type': 'apply_failed', 'info': 'final apply failed'})
                     return None, [d for d in dest_indices if d not in current_tree['added_dest_indices']]
 
                 current_tree['added_dest_indices'].append(d_idx)
@@ -795,11 +938,11 @@ class MSFCE_Solver:
         if not failed_unadded:
             return None, []
 
-        logger.info(f"Recall for req {request.get('id','?')} with {len(failed_unadded)} failed dests")
+        logger.info(f"Recall for req {request.get('id', '?')} with {len(failed_unadded)} failed dests")
 
         # 按资源需求排序（从小到大）
         dest_resources = [(d_idx, self._estimate_destination_resource(request, d_idx, network_state))
-                         for d_idx in failed_unadded]
+                          for d_idx in failed_unadded]
         dest_resources.sort(key=lambda x: x[1])
 
         # 优先尝试资源需求小的
@@ -849,7 +992,7 @@ class MSFCE_Solver:
             if self.metrics.get('processing_times'):
                 writer.writerow([])
                 writer.writerow(['Avg Processing Time (s)',
-                               np.mean(self.metrics['processing_times'])])
+                                 np.mean(self.metrics['processing_times'])])
 
         logger.info(f"Metrics exported to {path}")
 
@@ -859,7 +1002,7 @@ class MSFCE_Solver:
             'total_requests': self.metrics['total_requests'],
             'acceptance_rate': self.metrics['accepted'] / max(1, self.metrics['total_requests']),
             'cache_hit_rate': self.metrics['cache_hits'] /
-                             max(1, self.metrics['cache_hits'] + self.metrics['cache_misses']),
+                              max(1, self.metrics['cache_hits'] + self.metrics['cache_misses']),
             'failure_reasons': self.metrics.get('failure_reasons', {}),
         }
 
@@ -919,9 +1062,9 @@ class MSFCE_Solver:
 
             # 1. 快速资源预检查
             if not self._check_resource_feasibility(request, network_state):
-                logger.warning(f"Req {request.get('id','?')} skipped: insufficient resources")
+                logger.warning(f"Req {request.get('id', '?')} skipped: insufficient resources")
                 self.metrics['rejected'] += 1
-                self._record_failure(request.get('id','?'), {'type': 'global_resource_shortage'})
+                self._record_failure(request.get('id', '?'), {'type': 'global_resource_shortage'})
                 return None, []
 
             # 2. 正常树构建
@@ -946,11 +1089,11 @@ class MSFCE_Solver:
 
             # 4. 最终失败
             self.metrics['rejected'] += 1
-            self._record_failure(request.get('id','?'), {'type': 'construct_tree_failed'})
+            self._record_failure(request.get('id', '?'), {'type': 'construct_tree_failed'})
             return None, []
 
         except Exception as e:
-            logger.exception(f"Unexpected error in req {request.get('id','?')}: {e}")
+            logger.exception(f"Unexpected error in req {request.get('id', '?')}: {e}")
             self.metrics['errors'] += 1
             self.metrics['rejected'] += 1
             return None, []

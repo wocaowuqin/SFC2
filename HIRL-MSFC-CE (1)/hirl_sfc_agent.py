@@ -96,12 +96,14 @@ class Agent_SFC:
     # ---------------------------
     # Action selection with mask
     # ---------------------------
-    def selectMove(self, state: np.ndarray, goal_one_hot: np.ndarray, valid_actions: List[int]):
+    def selectMove(self, state: np.ndarray, goal_one_hot: np.ndarray, valid_actions: list):
         """
-        Epsilon-greedy with action masking.
-        - state: (dim,) or (1, dim)
-        - goal_one_hot: (n_goals,) or (1, n_goals)
-        - valid_actions: list of allowed action ids
+        修复版 selectMove
+
+        修复点:
+        1. 更健壮的 valid_actions 处理
+        2. 避免返回无效动作
+        3. 添加更多日志
         """
         state_b = self._to_batch(state)
         goal_b = self._to_batch(goal_one_hot)
@@ -110,52 +112,46 @@ class Agent_SFC:
         eps = float(self.exploration.value(self.update_count))
         self.controllerEpsilon = eps
 
-        # mask: create vector of -inf then set valid indices to 0
-        q_vals = self._safe_predict_q(self.net.controllerNet, state_b, goal_b)[0]  # (n_actions,)
+        # 获取 Q 值
+        q_vals = self._safe_predict_q(self.net.controllerNet, state_b, goal_b)[0]
 
+        # 🔧 修复: 更健壮的 valid_actions 处理
+        if valid_actions is None or len(valid_actions) == 0:
+            logger.warning("[selectMove] No valid_actions provided, using action 0")
+            return 0
+
+        # 过滤有效动作（在Q值范围内）
+        valid_idx = [a for a in valid_actions if 0 <= a < len(q_vals)]
+
+        if len(valid_idx) == 0:
+            # 🔧 修复: 如果没有有效动作，记录警告并返回0
+            logger.warning(
+                f"[selectMove] No valid actions in range [0, {len(q_vals)}). "
+                f"Provided: {valid_actions[:10]}... Returning 0"
+            )
+            return 0
+
+        # 创建掩码
         mask = np.full_like(q_vals, -1e9, dtype=np.float32)
-        if valid_actions:
-            valid_idx = [a for a in valid_actions if 0 <= a < len(q_vals)]
-            if len(valid_idx) == 0:
-                # fallback random
-                chosen = random.choice(valid_actions) if valid_actions else 0
-                return int(chosen)
-            mask[valid_idx] = 0.0
-        else:
-            # no valid actions, fallback to 0
-            mask[0] = 0.0
+        mask[valid_idx] = 0.0
 
         if random.random() > eps:
             # exploit: apply mask then argmax
             masked = q_vals + mask
             action = int(np.argmax(masked))
-            logger.debug("selectMove exploit chosen: %d (eps=%.4f)", action, eps)
+
+            # 🔧 额外检查: 确保选择的动作确实有效
+            if action not in valid_idx:
+                logger.warning(f"[selectMove] Argmax action {action} not in valid_idx, using first valid")
+                action = valid_idx[0]
+
+            logger.debug(f"[selectMove] Exploit: action={action}, eps={eps:.4f}")
             return action
         else:
             # explore uniformly among valid
-            if valid_actions:
-                action = int(random.choice(valid_actions))
-            else:
-                action = 0
-            logger.debug("selectMove explore chosen: %d (eps=%.4f)", action, eps)
+            action = int(random.choice(valid_idx))
+            logger.debug(f"[selectMove] Explore: action={action}, eps={eps:.4f}")
             return action
-
-    # ---------------------------
-    # 已修改为单独的文件reward_critic_enhanced
-    # ---------------------------
-    # def criticize(self, sub_task_completed: bool, cost: float, request_failed: bool):
-    #     """
-    #     Compute intrinsic reward for a low-level step.
-    #     Assumes cost is already normalized to ~[0,1].
-    #     """
-    #     reward = 0.0
-    #     if sub_task_completed:
-    #         reward += 3.0
-    #     # penalize cost
-    #     reward -= float(cost)
-    #     if request_failed:
-    #         reward -= 5.0
-    #     return float(np.clip(reward, -10.0, 1.0))
 
     # ---------------------------
     # Store experience into PER
@@ -186,45 +182,66 @@ class Agent_SFC:
     # ---------------------------
     # Build trainable_model (custom loss) and compile
     # ---------------------------
+    # ============================================
+    # 修复3: compile - Lambda 层 loss 设计
+    # ============================================
     def compile(self):
         """
-        Build trainable Keras model for masked loss updates.
-        The Hdqn_SFC.controllerNet is used to compute forward Q-values;
-        a Lambda layer computes masked huber loss and returns scalar loss.
+        修复版 compile
+
+        修复点:
+        1. 修正 masked_loss 中的 axis 参数
+        2. 添加梯度裁剪
         """
         if self.compiled:
             return
 
-        # create inputs wrappers referencing model inputs
-        inputs = self.net.controllerNet.input  # [state_input, goal_input]
+        from hirl_sfc_models import huber_loss
+
+        inputs = self.net.controllerNet.input
         y_true = Input(name='y_true', shape=(self.n_actions,), dtype='float32')
         mask = Input(name='mask', shape=(self.n_actions,), dtype='float32')
 
-        # using model output as y_pred
-        y_pred = self.net.controllerNet.output  # (batch, n_actions)
+        y_pred = self.net.controllerNet.output
 
         def masked_loss(args):
             y_t, y_p, m = args
             # huber per-element
             loss_elem = huber_loss(y_t, y_p, clip_value=1.0)
-            # apply mask
+            # apply mask (mask already includes IS weights if using weighted version)
             loss_elem = loss_elem * m
-            # sum across actions and mean across batch
-            return K.mean(K.sum(loss_elem, axis=-1), axis=0)
+            # 🔧 修复: 正确的 mean 计算
+            # 先在 action 维度求和，然后在 batch 维度求平均
+            return K.mean(K.sum(loss_elem, axis=-1))  # 移除 axis=0
 
         loss_out = tf.keras.layers.Lambda(masked_loss, name='loss')([y_true, y_pred, mask])
 
         trainable_model = Model(inputs=inputs + [y_true, mask], outputs=loss_out)
-        # loss is precomputed in Lambda layer, so use identity
-        trainable_model.compile(optimizer=self._optimizer, loss=lambda y_true, y_pred: y_pred)
+
+        # 🔧 修复: 添加梯度裁剪
+        optimizer = optimizers.RMSprop(
+            learning_rate=self.net.lr,
+            rho=0.95,
+            epsilon=1e-08,
+            clipnorm=10.0  # 梯度裁剪
+        )
+
+        trainable_model.compile(optimizer=optimizer, loss=lambda y_true, y_pred: y_pred)
         self.trainable_model = trainable_model
         self.compiled = True
-        logger.info("Agent trainable model compiled.")
+        logger.info("[Agent] Trainable model compiled with gradient clipping")
 
-    # ---------------------------
-    # Update: sample PER and perform DDQN update
-    # ---------------------------
+    # ============================================
+    # 修复2: train_from_memory - TD-error 计算时机
+    # ============================================
     def train_from_memory(self):
+        """
+        修复版 train_from_memory
+
+        修复点:
+        1. 在训练前计算 TD-error（而不是训练后）
+        2. 减少不必要的前向传播
+        """
         if not self.compiled:
             self.compile()
         if self.memory.size() < max(32, self.nSamples):
@@ -233,7 +250,6 @@ class Agent_SFC:
         # sample
         beta = float(self.beta_schedule.value(self.update_count))
         samples = self.memory.sample(self.nSamples, beta=beta)
-        # samples: dict with keys: states, goals, actions, rewards, next_states, dones, weights, idxes
 
         states = np.asarray(samples['states'], dtype=np.float32)
         goals = np.asarray(samples['goals'], dtype=np.float32)
@@ -245,43 +261,49 @@ class Agent_SFC:
         idxes = samples['idxes']
 
         # predict Q(s,a) and Q(next)
-        q_values = self._safe_predict_q(self.net.controllerNet, states, goals)  # (B, n_actions)
-        # Double DQN: online selects argmax on next, target evaluates
+        q_values = self._safe_predict_q(self.net.controllerNet, states, goals)
+
+        # Double DQN
         q_next_online = self._safe_predict_q(self.net.controllerNet, next_states, goals)
         q_next_target = self._safe_predict_q(self.net.targetControllerNet, next_states, goals)
 
-        # compute target y for each sample
-        next_actions = np.argmax(q_next_online, axis=1)  # action indices chosen by online net
+        # compute target
+        next_actions = np.argmax(q_next_online, axis=1)
         q_next_selected = q_next_target[np.arange(self.nSamples), next_actions]
         targets = rewards + (1.0 - dones) * self.gamma * q_next_selected
 
-        # create y_true as current q_values but with target updated at action indices
+        # 🔧 修复: 在训练前计算 TD-error
+        td_errors_before = np.abs(q_values[np.arange(self.nSamples), actions] - targets)
+
+        # create y_true
         y_true = q_values.copy()
         y_true[np.arange(self.nSamples), actions] = targets
 
-        # create mask to compute loss only on taken actions (or we can train all actions but weight them)
+        # create mask
         mask = np.zeros_like(y_true, dtype=np.float32)
         mask[np.arange(self.nSamples), actions] = 1.0
 
-        # perform one training step on the trainable model
-        # convert to float32 ensure dtype consistent
-        loss = self.trainable_model.train_on_batch([states, goals, y_true, mask], np.zeros((len(states),)))
-        # compute td_errors for PER update
-        q_updated = self._safe_predict_q(self.net.controllerNet, states, goals)
-        td_errors = np.abs(q_updated[np.arange(self.nSamples), actions] - targets)
+        # 🔧 修复: 应用 importance sampling weights
+        # 将权重应用到 mask 上
+        weighted_mask = mask * is_weights.reshape(-1, 1)
 
-        # update priorities in memory
-        self.memory.update_priorities(idxes, td_errors + 1e-6)
+        # train
+        loss = self.trainable_model.train_on_batch(
+            [states, goals, y_true, weighted_mask],
+            np.zeros((len(states),))
+        )
 
-        # soft/hard update target network
+        # 🔧 修复: 使用训练前的 TD-error 更新优先级
+        self.memory.update_priorities(idxes, td_errors_before + 1e-6)
+
+        # sync target network
         self.update_count += 1
         if self.update_count % self.hard_update == 0:
             self.net.targetControllerNet.set_weights(self.net.controllerNet.get_weights())
+            logger.debug(f"[Agent] Target network synced at step {self.update_count}")
 
-        # free memory
         gc.collect()
         return float(loss)
-
     # ---------------------------
     # Save / Load
     # ---------------------------

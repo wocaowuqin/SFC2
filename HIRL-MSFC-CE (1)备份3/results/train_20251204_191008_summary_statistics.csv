@@ -1,0 +1,27 @@
+Metric,Value
+Total Requests,39
+Full Acceptance Rate,100.00%
+Partial Acceptance Rate,0.00%
+Blocking Rate,0.00%
+""
+Avg CPU per Deployment,131.6667
+Avg BW per Deployment,77.5128
+Avg MEM per Deployment,99.8718
+""
+Avg CPU Utilization,38.99%
+Avg BW Utilization,7.28%
+Avg MEM Utilization,39.44%
+Std CPU Utilization,0.1478
+Std BW Utilization,0.0176
+Std MEM Utilization,0.1779
+""
+Avg Hops per Destination,2.67
+Avg Deployment Time (s),0.3379
+""
+Top Failed Nodes,
+""
+Failure Reasons,
+""
+Backup Policy Usage,
+  resource_aware,31
+  smart_greedy,6

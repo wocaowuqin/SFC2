@@ -1,27 +1,40 @@
-# sfc_backup_system/backup_policy.py
+# backup_policy_fixed.py
+"""
+修复版 BackupPolicy
+
+修复内容:
+1. never_fail 策略添加资源检查
+2. 改进 set_current_tree 处理邻接关系
+3. 添加更多调试信息
+4. 优化策略选择逻辑
+"""
 
 import logging
-import numpy as np  # 修复 1: 补充导入 numpy
+import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 
-from .utils import ensure_list, build_tree_vec, build_hvt_from_placement
-from .tree_cache import TreeCache
-from .path_finder import PathFinder
-from .path_eval import evaluate_path_score
-from .vnf_placement import VNFPlacement
+# 假设这些模块在同一包内
+try:
+    from .utils import ensure_list, build_tree_vec, build_hvt_from_placement
+    from .tree_cache import TreeCache
+    from .path_finder import PathFinder
+    from .path_eval import evaluate_path_score
+    from .vnf_placement import VNFPlacement
+except ImportError:
+    # 如果不是包导入，尝试直接导入
+    from utils import ensure_list, build_tree_vec, build_hvt_from_placement
+    from tree_cache import TreeCache
+    from path_finder import PathFinder
+    from path_eval import evaluate_path_score
+    from vnf_placement import VNFPlacement
 
 logger = logging.getLogger(__name__)
 
 
 class BackupPolicy:
     """
-    完整增强版 BackupPolicy (已修复 Bug)
-    - 动态策略选择
-    - 资源感知
-    - TreeCache 深度整合
-    - 多层 Never-Fail 降级
-    - 性能统计
+    完整增强版 BackupPolicy (修复版)
     """
 
     def __init__(self, expert, n: int, L: int, K_vnf: int,
@@ -51,48 +64,74 @@ class BackupPolicy:
             "total_failures": 0,
             "avg_score": 0.0,
             "cache_hits": 0,
-            "cache_misses": 0
+            "cache_misses": 0,
+            # 🔧 新增: 详细失败原因
+            "failure_reasons": {}
         }
 
     # --------------------------
-    # Tree / Request 更新方法
+    # 🔧 修复1: 改进的 Tree 设置方法
     # --------------------------
-    def set_current_tree(self, tree: Dict):
+    def set_current_tree(self, tree):
         """
-        设置当前树结构（由 Expert 生成）
-        必须包含: nodes (List/Set), adjacency (Dict)
+        设置当前树结构
+
+        支持多种输入格式:
+        1. List[int] - 节点列表
+        2. Set[int] - 节点集合
+        3. Dict - 完整树结构 {"nodes": [...], "adjacency": {...}}
         """
         if tree is None:
             self.current_tree = {"nodes": [], "adjacency": {}}
-            logger.warning("BackupPolicy: set_current_tree received None, using empty tree")
+            logger.warning("BackupPolicy: set_current_tree received None")
             return
 
-        # ✅ 标准化树结构
-        if isinstance(tree, list):  # 兼容只传节点列表的情况
+        # 处理不同输入类型
+        if isinstance(tree, (list, set)):
+            nodes = list(tree)
             self.current_tree = {
-                "nodes": list(tree),
-                "adjacency": {}
+                "nodes": nodes,
+                "adjacency": self._infer_adjacency(nodes)  # 🔧 新增: 推断邻接关系
             }
-        else:
+        elif isinstance(tree, dict):
             self.current_tree = {
                 "nodes": list(tree.get("nodes", [])),
                 "adjacency": dict(tree.get("adjacency", {})),
                 "root": tree.get("root")
             }
+        else:
+            logger.warning(f"BackupPolicy: Unknown tree type {type(tree)}")
+            self.current_tree = {"nodes": [], "adjacency": {}}
 
-        # ✅ 缓存失效
+        # 缓存失效
         self.tree_cache.invalidate()
 
-        logger.debug(
-            f"[BackupPolicy] Set new tree: size={len(self.current_tree['nodes'])}"
-        )
+        logger.debug(f"[BackupPolicy] Set tree: {len(self.current_tree['nodes'])} nodes")
+
+    def _infer_adjacency(self, nodes: List[int]) -> Dict[int, List[int]]:
+        """
+        🔧 新增: 从节点列表推断简单的线性邻接关系
+        这是一个简化版本，假设节点按路径顺序排列
+        """
+        if len(nodes) <= 1:
+            return {}
+
+        adjacency = {}
+        for i, node in enumerate(nodes):
+            neighbors = []
+            if i > 0:
+                neighbors.append(nodes[i - 1])
+            if i < len(nodes) - 1:
+                neighbors.append(nodes[i + 1])
+            if neighbors:
+                adjacency[node] = neighbors
+
+        return adjacency
 
     def set_current_request(self, request: Dict):
-        """保存当前业务请求"""
         self.current_request = request or {}
 
-    # 别名方法
-    def update_tree(self, tree: Dict):
+    def update_tree(self, tree):
         self.set_current_tree(tree)
 
     def update_request(self, request: Dict):
@@ -102,16 +141,11 @@ class BackupPolicy:
     # 工具函数
     # --------------------------
     def _is_dc_node(self, nd: int) -> bool:
-        """检查节点是否为数据中心"""
         if self.dc_nodes:
             return int(nd) in self.dc_nodes
         return int(nd) % 3 == 0
 
-    # --------------------------
-    # 改进 1：增强版 top-k 选择 + TreeCache
-    # --------------------------
     def _select_top_k(self, node_list: List[int], dst: int, k: int = 5) -> List[int]:
-        """使用 TreeCache 缓存路径代价进行智能选择"""
         if not node_list:
             return []
         if len(node_list) <= k:
@@ -121,31 +155,32 @@ class BackupPolicy:
         adjacency = self.current_tree.get("adjacency", {})
 
         for nd in node_list:
-            cost = self.tree_cache.get(nd, dst)  # tree_cache.py 中方法名为 get
+            cost = self.tree_cache.get(nd, dst)
 
             if cost is None:
                 self.stats["cache_misses"] += 1
                 cost = self._bfs_tree_distance(nd, dst, adjacency)
-                self.tree_cache.set(nd, dst, cost)  # tree_cache.py 中方法名为 set
+                self.tree_cache.set(nd, dst, cost)
             else:
                 self.stats["cache_hits"] += 1
 
             scored.append((cost, nd))
 
         scored.sort(key=lambda x: x[0])
-        selected = [nd for _, nd in scored[:k]]
-        return selected
+        return [nd for _, nd in scored[:k]]
 
     def _bfs_tree_distance(self, src: int, dst: int, adjacency: Dict) -> int:
-        """BFS 计算树内两点距离"""
-        if src == dst: return 0
-        if not adjacency or src not in adjacency: return 999
+        if src == dst:
+            return 0
+        if not adjacency or src not in adjacency:
+            return 999
 
         q = deque([(src, 0)])
         visited = {src}
         while q:
             u, dist = q.popleft()
-            if u == dst: return dist
+            if u == dst:
+                return dist
             for v in adjacency.get(u, []):
                 if v not in visited:
                     visited.add(v)
@@ -153,10 +188,9 @@ class BackupPolicy:
         return 999
 
     # --------------------------
-    # 改进 2：网络状态标准化
+    # 网络状态标准化
     # --------------------------
     def _prepare_network_state(self, network_state: Dict) -> Dict:
-        """统一整理 network_state 输入格式"""
         state = dict(network_state or {})
         state.setdefault("cpu", {})
         state.setdefault("mem", {})
@@ -173,54 +207,33 @@ class BackupPolicy:
         return state
 
     # --------------------------
-    # 资源检查工具
+    # 🔧 修复2: 增强的资源检查
     # --------------------------
-    def _check_bandwidth_feasible(self, links, state):
-        """
-        检查链路带宽是否满足需求
-        """
-        bw_resources = state.get('bw')  # numpy array or dict
+    def _check_bandwidth_feasible(self, links: List[int], state: Dict) -> bool:
+        """检查链路带宽是否满足需求"""
+        bw_resources = state.get('bw')
+        bw_demand = state.get("bw_demand", 0)
 
-        # 1. 优先从已经 prepare 过的 state 中获取标准化需求
-        bw_demand = state.get("bw_demand")
-
-        # 2. 如果 state 中意外没有，尝试从 request 中获取 (兼容 bw_origin)
-        if bw_demand is None:
-            req = self.current_request
-            # 您的数据主要使用 bw_origin
-            bw_demand = req.get("bw_origin") or req.get("bw_demand") or req.get("bw")
-
-            # 处理嵌套的 demand 字典
-            if bw_demand is None and isinstance(req.get("demand"), dict):
-                bw_demand = req["demand"].get("bw")
-
-        # 3. 如果仍然找不到（或者是 0），则默认不需要带宽检查
-        if bw_demand is None:
-            # 记录警告但允许通过，或者抛出更明确的错误
-            # 这里我们假设如果没有定义带宽，则默认为 0
-            bw_demand = 0.0
-
-        # 如果需求为 0，直接通过
-        if bw_demand <= 1e-6:
+        if bw_demand is None or bw_demand <= 1e-6:
             return True
 
-        # 4. 执行检查
+        if bw_resources is None:
+            return True  # 没有资源信息时保守通过
+
         for lid in links:
             idx = int(lid) - 1
 
-            # 获取当前链路可用带宽
             if isinstance(bw_resources, (np.ndarray, list)):
                 if idx < 0 or idx >= len(bw_resources):
-                    logger.warning(f"[BW Check] Link ID {lid} out of bounds")
-                    return False
+                    continue
                 avail_bw = float(bw_resources[idx])
             elif isinstance(bw_resources, dict):
                 avail_bw = float(bw_resources.get(idx, 0))
             else:
-                # 如果没有资源信息，保守起见认为不足
-                return False
+                continue
 
             if avail_bw < bw_demand:
+                logger.debug(f"[BW Check] Link {lid}: avail={avail_bw:.2f} < demand={bw_demand:.2f}")
                 return False
 
         return True
@@ -234,13 +247,22 @@ class BackupPolicy:
 
         for vnf_idx, node in placement.items():
             node_idx = int(node) - 1
-            if vnf_idx >= len(cpu_demand) or vnf_idx >= len(mem_demand): continue
+            if vnf_idx >= len(cpu_demand) or vnf_idx >= len(mem_demand):
+                continue
 
             cpu_need = cpu_demand[vnf_idx]
             mem_need = mem_demand[vnf_idx]
 
-            # 使用 loose check (>= 0.1) 或者 strict check
-            if cpu_res.get(node_idx, 0) < cpu_need or mem_res.get(node_idx, 0) < mem_need:
+            cpu_avail = cpu_res.get(node_idx, 0) if isinstance(cpu_res, dict) else (
+                cpu_res[node_idx] if node_idx < len(cpu_res) else 0
+            )
+            mem_avail = mem_res.get(node_idx, 0) if isinstance(mem_res, dict) else (
+                mem_res[node_idx] if node_idx < len(mem_res) else 0
+            )
+
+            if cpu_avail < cpu_need or mem_avail < mem_need:
+                logger.debug(
+                    f"[Node Check] Node {node}: cpu={cpu_avail:.2f}<{cpu_need:.2f} or mem={mem_avail:.2f}<{mem_need:.2f}")
                 return False
         return True
 
@@ -249,31 +271,38 @@ class BackupPolicy:
     # --------------------------
     def _resource_aware_strategy(self, dst: int, state: Dict) -> Dict:
         tree_nodes = state.get("tree_nodes", [])
-        if not tree_nodes: return {"feasible": False}
+        if not tree_nodes:
+            return {"feasible": False, "reason": "no_tree_nodes"}
 
         candidates = self._select_top_k(tree_nodes, dst, k=8)
+
         for cand in candidates:
             nodes, links = self.path_finder.find_any_path(cand, dst)
-            if not nodes or not links: continue
+            if not nodes or not links:
+                continue
 
-            if not self._check_bandwidth_feasible(links, state): continue
+            if not self._check_bandwidth_feasible(links, state):
+                continue
 
             placement = VNFPlacement.resource_aware(state["vnf_seq"], nodes, state, self._is_dc_node)
-            if placement is None: continue
+            if placement is None:
+                continue
 
-            if not self._check_node_resources_feasible(nodes, placement, state): continue
+            if not self._check_node_resources_feasible(nodes, placement, state):
+                continue
 
             score = evaluate_path_score(nodes, links, state, self._is_dc_node)
             return {"feasible": True, "nodes": nodes, "links": links, "placement": placement, "score": score}
 
-        return {"feasible": False}
+        return {"feasible": False, "reason": "no_feasible_path"}
 
     # --------------------------
     # 策略 2: Smart Greedy
     # --------------------------
     def _smart_greedy_strategy(self, dst: int, state: Dict) -> Dict:
         tree_nodes = state.get("tree_nodes", [])
-        if not tree_nodes: return {"feasible": False}
+        if not tree_nodes:
+            return {"feasible": False, "reason": "no_tree_nodes"}
 
         candidates = self._select_top_k(tree_nodes, dst, k=6)
         best_plan = None
@@ -281,7 +310,8 @@ class BackupPolicy:
 
         for cand in candidates:
             nodes, links = self.path_finder.find_any_path(cand, dst)
-            if not nodes or not links: continue
+            if not nodes or not links:
+                continue
 
             score = evaluate_path_score(nodes, links, state, self._is_dc_node)
             if score > best_score:
@@ -290,14 +320,15 @@ class BackupPolicy:
                 placement = VNFPlacement.simple_round_robin(vnf_seq, nodes, self._is_dc_node) if vnf_seq else {}
                 best_plan = {"feasible": True, "nodes": nodes, "links": links, "placement": placement, "score": score}
 
-        return best_plan or {"feasible": False}
+        return best_plan or {"feasible": False, "reason": "no_path_found"}
 
     # --------------------------
     # 策略 3: Minimal
     # --------------------------
     def _minimal_strategy(self, dst: int, state: Dict) -> Dict:
         tree_nodes = state.get("tree_nodes", [])
-        if not tree_nodes: return {"feasible": False}
+        if not tree_nodes:
+            return {"feasible": False, "reason": "no_tree_nodes"}
 
         candidates = self._select_top_k(tree_nodes, dst, k=6)
         best_plan = None
@@ -305,7 +336,8 @@ class BackupPolicy:
 
         for cand in candidates:
             nodes, links = self.path_finder.find_any_path(cand, dst)
-            if not nodes or not links: continue
+            if not nodes or not links:
+                continue
 
             hops = len(nodes) - 1
             if hops < best_hops:
@@ -314,75 +346,160 @@ class BackupPolicy:
                 placement = VNFPlacement.simple_round_robin(vnf_seq, nodes, self._is_dc_node) if vnf_seq else {}
                 best_plan = {"feasible": True, "nodes": nodes, "links": links, "placement": placement, "score": -hops}
 
-        return best_plan or {"feasible": False}
+        return best_plan or {"feasible": False, "reason": "no_path_found"}
 
     # --------------------------
-    # 改进 3：增强 Never-Fail 策略
+    # 🔧 修复3: 增强 Never-Fail 策略（添加资源检查）
     # --------------------------
     def _never_fail_strategy(self, dst: int, state: Dict) -> Dict:
-        """多层降级策略"""
+        """多层降级策略 - 修复版"""
         src = state.get("source", 1)
         node_num = getattr(self.expert, "node_num", self.n)
         tree_nodes = state.get("tree_nodes", [])
+        bw_demand = state.get("bw_demand", 0)
 
-        # Layer 1: k-paths from tree nodes
+        # Layer 1: k-paths from tree nodes (带资源检查)
         for nd in tree_nodes:
             for k in range(1, self.path_finder.max_k + 1):
                 try:
-                    # 修复 2: 这里的解包需要处理 3 个返回值 (nodes, dist, links)
-                    # 之前写成了 nodes, links = result[:2] 是错的，因为 result[1] 是 distance
                     nodes, _, links = self.path_finder.get_k_path(nd, dst, k)
 
                     if nodes and links:
-                        return {"feasible": True, "nodes": nodes, "links": links, "placement": {}, "score": -len(nodes)}
-                except Exception:
+                        # 🔧 修复: 添加带宽检查
+                        if bw_demand > 0 and not self._check_bandwidth_feasible(links, state):
+                            continue
+
+                        vnf_seq = state.get("vnf_seq", [])
+                        placement = VNFPlacement.simple_round_robin(vnf_seq, nodes, self._is_dc_node) if vnf_seq else {}
+
+                        return {
+                            "feasible": True,
+                            "nodes": nodes,
+                            "links": links,
+                            "placement": placement,
+                            "score": -len(nodes)
+                        }
+                except Exception as e:
+                    logger.debug(f"Layer1 failed: {e}")
                     pass
 
-        # Layer 2: DC relay
+        # Layer 2: DC relay (带资源检查)
         dc_nodes = [n for n in range(1, node_num + 1) if self._is_dc_node(n) and n not in {src, dst}]
-        for relay in dc_nodes:
+        for relay in dc_nodes[:10]:  # 限制搜索数量
             try:
                 nodes, links = self.path_finder.compose_via_relay(src, relay, dst)
                 if nodes and links:
-                    return {"feasible": True, "nodes": nodes, "links": links, "placement": {},
-                            "score": -1.2 * len(nodes)}
-            except Exception:
+                    # 🔧 修复: 添加带宽检查
+                    if bw_demand > 0 and not self._check_bandwidth_feasible(links, state):
+                        continue
+
+                    vnf_seq = state.get("vnf_seq", [])
+                    placement = VNFPlacement.simple_round_robin(vnf_seq, nodes, self._is_dc_node) if vnf_seq else {}
+
+                    return {
+                        "feasible": True,
+                        "nodes": nodes,
+                        "links": links,
+                        "placement": placement,
+                        "score": -1.2 * len(nodes)
+                    }
+            except Exception as e:
+                logger.debug(f"Layer2 DC relay failed: {e}")
                 pass
 
-        # Layer 3: All relay
-        for relay in range(1, node_num + 1):
-            if relay in {src, dst}: continue
+        # Layer 3: 任意中继 (最后尝试，仍然检查资源)
+        for relay in range(1, min(node_num + 1, 30)):  # 限制搜索范围
+            if relay in {src, dst}:
+                continue
             try:
                 nodes, links = self.path_finder.compose_via_relay(src, relay, dst)
                 if nodes and links:
-                    return {"feasible": True, "nodes": nodes, "links": links, "placement": {},
-                            "score": -1.5 * len(nodes)}
+                    # 🔧 修复: 添加带宽检查
+                    if bw_demand > 0 and not self._check_bandwidth_feasible(links, state):
+                        continue
+
+                    vnf_seq = state.get("vnf_seq", [])
+                    placement = VNFPlacement.simple_round_robin(vnf_seq, nodes, self._is_dc_node) if vnf_seq else {}
+
+                    return {
+                        "feasible": True,
+                        "nodes": nodes,
+                        "links": links,
+                        "placement": placement,
+                        "score": -1.5 * len(nodes)
+                    }
+            except Exception as e:
+                logger.debug(f"Layer3 relay failed: {e}")
+                pass
+
+        # 🔧 新增: Layer 4 - 无资源检查的最后尝试
+        # 只在资源检查全部失败后才使用
+        logger.warning(f"[Never-Fail] All resource-checked paths failed for dst={dst}, trying without check")
+
+        for relay in range(1, min(node_num + 1, 20)):
+            if relay in {src, dst}:
+                continue
+            try:
+                nodes, links = self.path_finder.compose_via_relay(src, relay, dst)
+                if nodes and links:
+                    vnf_seq = state.get("vnf_seq", [])
+                    placement = VNFPlacement.simple_round_robin(vnf_seq, nodes, self._is_dc_node) if vnf_seq else {}
+
+                    return {
+                        "feasible": True,
+                        "nodes": nodes,
+                        "links": links,
+                        "placement": placement,
+                        "score": -2.0 * len(nodes),  # 更低的分数
+                        "warning": "no_resource_check"
+                    }
             except Exception:
                 pass
 
-        return {"feasible": False, "nodes": [], "links": [], "placement": {}, "score": -1e9}
+        return {"feasible": False, "nodes": [], "links": [], "placement": {}, "score": -1e9, "reason": "all_failed"}
 
     # --------------------------
-    # 改进 4：动态策略选择
+    # 动态策略选择
     # --------------------------
     def _select_strategies(self, state: Dict) -> List[Tuple]:
         vnf_count = len(state.get("vnf_seq", []))
         cpu_res = state.get("cpu", {})
-        avg_cpu_util = 1.0 - (sum(cpu_res.values()) / max(1, len(cpu_res) * 2000)) if cpu_res else 0.5
 
+        # 计算平均CPU利用率
+        if cpu_res:
+            if isinstance(cpu_res, dict):
+                total_cpu = sum(cpu_res.values())
+                max_cpu = len(cpu_res) * 2000
+            else:
+                total_cpu = sum(cpu_res)
+                max_cpu = len(cpu_res) * 2000
+            avg_cpu_util = 1.0 - (total_cpu / max(1, max_cpu))
+        else:
+            avg_cpu_util = 0.5
+
+        # 根据VNF数量和资源利用率选择策略顺序
         if vnf_count >= 3 and avg_cpu_util > 0.7:
-            return [(self._resource_aware_strategy, "resource_aware", 1.0),
-                    (self._smart_greedy_strategy, "smart_greedy", 0.8),
-                    (self._minimal_strategy, "minimal", 0.6)]
+            # 资源紧张，优先资源感知
+            return [
+                (self._resource_aware_strategy, "resource_aware", 1.0),
+                (self._smart_greedy_strategy, "smart_greedy", 0.8),
+                (self._minimal_strategy, "minimal", 0.6)
+            ]
 
         if vnf_count == 0 or avg_cpu_util < 0.3:
-            return [(self._minimal_strategy, "minimal", 1.0),
-                    (self._smart_greedy_strategy, "smart_greedy", 0.9),
-                    (self._resource_aware_strategy, "resource_aware", 0.7)]
+            # 资源充足，优先最短路径
+            return [
+                (self._minimal_strategy, "minimal", 1.0),
+                (self._smart_greedy_strategy, "smart_greedy", 0.9),
+                (self._resource_aware_strategy, "resource_aware", 0.7)
+            ]
 
-        return [(self._smart_greedy_strategy, "smart_greedy", 1.0),
-                (self._resource_aware_strategy, "resource_aware", 0.9),
-                (self._minimal_strategy, "minimal", 0.8)]
+        # 默认：平衡策略
+        return [
+            (self._smart_greedy_strategy, "smart_greedy", 1.0),
+            (self._resource_aware_strategy, "resource_aware", 0.9),
+            (self._minimal_strategy, "minimal", 0.8)
+        ]
 
     # --------------------------
     # 结果标准化
@@ -394,11 +511,11 @@ class BackupPolicy:
                 "nodes": [],
                 "links": [],
                 "placement": {},
-                "tree": np.zeros(self.L),  # 需要 numpy
-                "hvt": np.zeros((self.n, self.K_vnf)),  # 需要 numpy
+                "tree": np.zeros(self.L),
+                "hvt": np.zeros((self.n, self.K_vnf)),
                 "score": -1e9,
                 "backup_type": plan.get("backup_type", "none"),
-                "error": plan.get("error", "unknown")
+                "error": plan.get("reason", plan.get("error", "unknown"))
             }
 
         nodes = plan.get("nodes", [])
@@ -414,7 +531,8 @@ class BackupPolicy:
             "hvt": build_hvt_from_placement(placement, self.n, self.K_vnf),
             "new_path_full": nodes,
             "backup_type": plan.get("backup_type", "hybrid"),
-            "score": float(plan.get("score", 0.0))
+            "score": float(plan.get("score", 0.0)),
+            "warning": plan.get("warning")
         }
 
     # --------------------------
@@ -423,20 +541,27 @@ class BackupPolicy:
     def get_backup_plan(self, goal_dest_idx: int, network_state: Dict[str, Any]) -> Dict[str, Any]:
         self.stats["total_calls"] += 1
         req = self.current_request
-        if not req: return {"feasible": False, "error": "no_request"}
+
+        if not req:
+            self._record_failure("no_request")
+            return {"feasible": False, "error": "no_request"}
 
         try:
             dest_list = req.get("dest", [])
-            if goal_dest_idx < 0 or goal_dest_idx >= len(dest_list): raise IndexError
+            if goal_dest_idx < 0 or goal_dest_idx >= len(dest_list):
+                raise IndexError(f"goal_dest_idx={goal_dest_idx} out of range [0, {len(dest_list)})")
             dst = int(dest_list[goal_dest_idx])
-        except Exception:
-            return {"feasible": False, "error": "invalid_dest"}
+        except Exception as e:
+            self._record_failure("invalid_dest")
+            return {"feasible": False, "error": f"invalid_dest: {e}"}
 
         try:
             state = self._prepare_network_state(network_state)
         except Exception as e:
+            self._record_failure("state_prep_failed")
             return {"feasible": False, "error": str(e)}
 
+        # 尝试各策略
         strategies = self._select_strategies(state)
 
         for func, name, priority in strategies:
@@ -447,14 +572,15 @@ class BackupPolicy:
                     plan["backup_type"] = name
                     self.stats["strategy_success"][name] += 1
 
+                    # 更新平均分数
                     tc = self.stats["total_calls"]
                     prev_avg = self.stats["avg_score"]
                     self.stats["avg_score"] = (prev_avg * (tc - 1) + plan.get("score", 0)) / tc
 
-                    logger.debug(f"[BackupPolicy] Strategy {name} succeeded")
+                    logger.debug(f"[BackupPolicy] Strategy {name} succeeded for dst={dst}")
                     return self._normalize_plan(plan)
             except Exception as e:
-                logger.warning(f"Strategy {name} failed: {e}", exc_info=True)
+                logger.warning(f"Strategy {name} failed: {e}")
 
         # Never Fail
         try:
@@ -463,11 +589,16 @@ class BackupPolicy:
             if plan.get("feasible"):
                 self.stats["strategy_success"]["never_fail"] += 1
             else:
-                self.stats["total_failures"] += 1
+                self._record_failure("never_fail_failed")
             return self._normalize_plan(plan)
         except Exception as e:
-            self.stats["total_failures"] += 1
+            self._record_failure(f"exception: {e}")
             return {"feasible": False, "error": str(e)}
+
+    def _record_failure(self, reason: str):
+        """记录失败原因"""
+        self.stats["total_failures"] += 1
+        self.stats["failure_reasons"][reason] = self.stats["failure_reasons"].get(reason, 0) + 1
 
     # --------------------------
     # 性能统计接口
@@ -487,5 +618,27 @@ class BackupPolicy:
         self.stats = {
             "total_calls": 0,
             "strategy_success": {"resource_aware": 0, "smart_greedy": 0, "minimal": 0, "never_fail": 0},
-            "total_failures": 0, "avg_score": 0.0, "cache_hits": 0, "cache_misses": 0
+            "total_failures": 0,
+            "avg_score": 0.0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "failure_reasons": {}
         }
+
+    def print_statistics(self):
+        """打印详细统计"""
+        stats = self.get_statistics()
+        print("\n" + "=" * 50)
+        print("BackupPolicy Statistics")
+        print("=" * 50)
+        print(f"Total Calls:    {stats['total_calls']}")
+        print(f"Success Rate:   {stats['success_rate']:.2%}")
+        print(f"Cache Hit Rate: {stats['cache_hit_rate']:.2%}")
+        print(f"Avg Score:      {stats['avg_score']:.3f}")
+        print("\nStrategy Success Counts:")
+        for name, count in stats['strategy_success'].items():
+            print(f"  {name}: {count}")
+        print("\nFailure Reasons:")
+        for reason, count in stats.get('failure_reasons', {}).items():
+            print(f"  {reason}: {count}")
+        print("=" * 50 + "\n")
