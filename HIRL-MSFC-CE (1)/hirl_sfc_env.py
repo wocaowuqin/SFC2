@@ -144,6 +144,16 @@ class SFC_HIRL_Env(gym.Env):
             "total_mem": float(total_mem)
         }
         self.metrics_logger = VNFMetricsLogger(network_info)
+        # 🔥 新增: 多目标集合管理
+        self.destination_set: Set[int] = set()  # 所有目标节点
+        self.served_destinations: Set[int] = set()  # 已服务的目标
+
+        # 🔥 新增: VNF共享状态
+        self.vnf_sharing_map: Dict[Tuple[int, int], Set[int]] = {}
+        # Key: (node_id, vnf_type), Value: set of destination indices sharing this VNF
+
+        # 🔥 新增: 共享策略状态
+        self.sharing_strategy: int = 0  # 0-3对应4种策略
 
         # =========================================================
         # 5. 初始化可视化器 (Visualizer)
@@ -420,6 +430,10 @@ class SFC_HIRL_Env(gym.Env):
 
         if self.current_request is None:
             return None, self._get_flat_state()
+        # 🔥 新增: 初始化多目标集合
+        self.destination_set = set(self.current_request.get('dest', []))
+        self.served_destinations = set()
+        self.vnf_sharing_map = {}
 
         self.total_requests_seen += 1
         self.total_dest_seen += len(self.current_request.get('dest', []))
@@ -1122,3 +1136,56 @@ class SFC_HIRL_Env(gym.Env):
             title=title,
             save_path=full_path  # <--- 传入路径
         )
+
+        # ========== 修改3: VNF共享检查 (新增方法) ==========
+        def can_share_vnf(self, node_id: int, vnf_type: int, dest_idx: int) -> bool:
+            """
+            检查目标dest_idx是否可以共享节点node_id上的vnf_type实例
+
+            Args:
+                node_id: 节点ID (1-based)
+                vnf_type: VNF类型 (0-based)
+                dest_idx: 目标索引 (0-based)
+
+            Returns:
+                True if 可以共享
+            """
+            key = (node_id, vnf_type)
+
+            # 如果该位置没有VNF实例,不能共享
+            node_idx = node_id - 1
+            if self.hvt_all[node_idx, vnf_type] == 0:
+                return False
+
+            # 检查资源是否充足 (简化版,实际需要更复杂的逻辑)
+            # 这里假设每个VNF实例可以服务最多3个目标
+            if key in self.vnf_sharing_map:
+                return len(self.vnf_sharing_map[key]) < 3
+
+            return True
+
+        def share_vnf(self, node_id: int, vnf_type: int, dest_idx: int):
+            """记录VNF共享"""
+            key = (node_id, vnf_type)
+            if key not in self.vnf_sharing_map:
+                self.vnf_sharing_map[key] = set()
+            self.vnf_sharing_map[key].add(dest_idx)
+
+        def get_vnf_sharing_rate(self) -> float:
+            """
+            计算当前请求的VNF共享率
+
+            Returns:
+                共享率 ∈ [0, 1]
+            """
+            if not self.vnf_sharing_map:
+                return 0.0
+
+            total_vnf_instances = sum(len(dests) for dests in self.vnf_sharing_map.values())
+            unique_vnf_instances = len(self.vnf_sharing_map)
+
+            if total_vnf_instances == 0:
+                return 0.0
+
+            # 共享率 = 1 - (独立实例数 / 总需求数)
+            return 1.0 - (unique_vnf_instances / total_vnf_instances)
