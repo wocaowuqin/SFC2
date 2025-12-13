@@ -1,4 +1,0 @@
-Time_Interval,Request_Count,Acceptance_Rate,Total_CPU_Consumed,Total_BW_Consumed
-50,11,100.00%,1155.0000,611.0000
-100,47,100.00%,6695.0000,3608.0000
-150,24,100.00%,3105.0000,1615.0000
